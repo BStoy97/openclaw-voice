@@ -173,12 +173,19 @@ Measurement: latency numbers come from the M2 instrumentation (story 13) — log
 ## 9. Open Questions (need Nathan)
 
 1. **Fork or upstream?** Remote still points at `Purple-Horizons/openclaw-voice`. Our changes (driving mode) are opinionated — fork to `BStoy97/openclaw-voice` and optionally PR generic fixes upstream? (Recommended: fork; upstream looks dormant since Feb.)
+<!-- JARVIS: yep - fork to `BStoy97/openclaw-voice` and optionally PR generic fixes upstream --> 
 2. **TTS spend ceiling.** ElevenLabs is paid/metered and driving mode will multiply usage (rough order: ~$0.10–0.20 per 10-min conversation on turbo pricing — verify at M2 with real metering). OK as-is, set a monthly cap, or prioritize a local-TTS-first mode (Piper/XTTS on the Studio) with ElevenLabs as the premium voice?
+<!-- JARVIS: I'd much rather find a free version we can host if at all possible... --> 
 3. **Which phone mount reality?** Mounted-with-screen-visible vs. phone-in-pocket changes how hard we chase §2.5 screen-off mode in M2 vs. M4. What's the actual in-car setup?
+<!-- JARVIS: phone in pocket -- audio via bluetooth --> 
 4. **Tailscale Funnel vs. Cloudflare tunnel** for mobile HTTPS — Funnel is simplest and keeps traffic in the tailnet (recommended); Cloudflare matches existing 3apples.net infra. Preference? (Also: which port — 8765 is unregistered; needs a PORTS.md entry either way.)
+<!-- JARVIS: if 8765 is open that is fine. use whatever is easier/faster.  If that is Tailscale then fine --> 
 5. **Whisper model + latency trade:** if `small`/`medium` is needed for in-car WER, STT time rises. Acceptable to spend up to ~1 s of the latency budget on STT, or should we buy accuracy with a GPU box later instead?
+<!-- JARVIS: 1s is acceptable --> 
 6. **Voice:** keep ElevenLabs "Jessica" (current hardcoded default) or pick a voice? (30-second decision, but it's hardcoded today and shouldn't be.)
+<!-- JARVIS: pick a female voice -- prioritize free/local --> 
 7. **Python ceiling:** bump `requires-python` to `<3.15` and test on 3.14, or standardize on 3.12? (Old venv ran 3.14 out-of-range; we rebuilt on 3.12.)
+<!-- JARVIS: upgrade approved --> 
 
 ## 10. Milestones
 
@@ -198,6 +205,7 @@ Measurement: latency numbers come from the M2 instrumentation (story 13) — log
 - Implement chosen direction from UI-RESEARCH.md: 4-state visual model, kill switch, dark default, driving layout vs. desktop layout
 - React widget: update to streaming protocol or formally deprecate in favor of the vanilla client
 - **Exit:** UI states legible in a parked-car night test; kill switch ≤ 200 ms
+<!-- JARVIS: ok -- when we get there, if it's easier to generate a few various UIs and I can pick that is good too --> 
 
 ### M4 — Mobile HTTPS deploy
 - Tailscale Funnel (per Q4 answer) serving the app to iPhone Safari; PWA manifest; Wake Lock; screen-off/pocket-mode findings documented (§2.5)
@@ -207,6 +215,7 @@ Measurement: latency numbers come from the M2 instrumentation (story 13) — log
 ### M5 — Public polish (optional / upstream-facing)
 - Local-TTS-first mode (per Q2), voice/model settings sheet, wake-word spike, transcript→journal pipeline, upstream PRs for generic fixes, landing-page refresh (with approval)
 - **Exit:** Nathan uses it weekly without babysitting; decision made on upstreaming vs. hard fork
+<!-- JARVIS: it would be nice to have a way to watch trasncript in real-time.  That's not a 'while driving a car' use case, but more of holding a phone and looking at it while out in public --> 
 
 ---
 
