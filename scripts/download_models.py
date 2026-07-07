@@ -16,6 +16,9 @@ Whisper models:
 Piper voices (local TTS, default backend):
     en_US-amy-medium    - default female en_US voice
     en_US-lessac-medium - fallback if amy is unavailable
+
+Smart-turn (semantic end-of-turn detection):
+    python scripts/download_models.py smart-turn
 """
 
 import sys
@@ -27,6 +30,14 @@ PIPER_VOICES_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
 PIPER_MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "piper"
 DEFAULT_PIPER_VOICE = "en_US-amy-medium"
 FALLBACK_PIPER_VOICE = "en_US-lessac-medium"
+
+# pipecat-ai smart-turn-v3 (BSD-2-Clause): semantic end-of-turn classifier.
+# int8-quantized CPU checkpoint (~8 MB); verified filename on the HF repo.
+SMART_TURN_URL = (
+    "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/"
+    "smart-turn-v3.2-cpu.onnx"
+)
+SMART_TURN_MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "smart-turn"
 
 
 def download_model(model_name: str = "base"):
@@ -101,6 +112,29 @@ def download_piper_voice(voice_name: str = DEFAULT_PIPER_VOICE) -> bool:
     return False
 
 
+def download_smart_turn() -> bool:
+    """Download the smart-turn-v3 ONNX model into models/smart-turn/."""
+    filename = SMART_TURN_URL.rsplit("/", 1)[-1]
+    dest = SMART_TURN_MODEL_DIR / filename
+
+    if dest.exists() and dest.stat().st_size > 1_000_000:
+        print(f"✅ Smart-turn model already present: {dest}")
+        return True
+
+    try:
+        SMART_TURN_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading smart-turn model: {filename}")
+        urllib.request.urlretrieve(SMART_TURN_URL, dest)
+        if dest.stat().st_size < 1_000_000:
+            raise IOError(f"Downloaded file suspiciously small ({dest.stat().st_size} bytes)")
+        print(f"✅ Downloaded smart-turn model to {dest}")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to download smart-turn model: {e}")
+        dest.unlink(missing_ok=True)
+        return False
+
+
 def list_models():
     """List available models."""
     models = {
@@ -137,6 +171,10 @@ if __name__ == "__main__":
         if model == "piper":
             voice = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_PIPER_VOICE
             ok = download_piper_voice(voice)
+            sys.exit(0 if ok else 1)
+
+        if model in ("smart-turn", "smart_turn"):
+            ok = download_smart_turn()
             sys.exit(0 if ok else 1)
 
     download_model(model)

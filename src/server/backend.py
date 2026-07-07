@@ -171,3 +171,20 @@ class AIBackend:
     def clear_history(self):
         """Clear conversation history."""
         self.conversation_history = []
+
+    def clone_for_session(self) -> "AIBackend":
+        """Per-connection clone: shares the underlying API client (no new
+        connection pool) but gets a fresh, private conversation history.
+
+        Fixes the shared-global-history bug (every WebSocket client used to
+        share one conversation).
+        """
+        clone = self.__class__.__new__(self.__class__)
+        clone.backend_type = self.backend_type
+        clone.url = self.url
+        clone.model = self.model
+        clone.api_key = self.api_key
+        clone.system_prompt = self.system_prompt
+        clone.conversation_history = []
+        clone._client = self._client
+        return clone

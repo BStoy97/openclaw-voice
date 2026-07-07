@@ -11,3 +11,6 @@ build/
 .ruff_cache/
 *.log
 .DS_Store
+
+# Model binaries (fetch via scripts/download_models.py)
+models/**/*.onnx
