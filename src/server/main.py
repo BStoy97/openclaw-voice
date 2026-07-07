@@ -570,6 +570,23 @@ async def websocket_endpoint(websocket: WebSocket):
                             "speech_detected": has_speech,
                         })
 
+            elif msg["type"] == "session_stop":
+                # Kill switch: cancel any in-flight response, drop buffered
+                # turn audio, and leave continuous mode.
+                cancelled = await _cancel_response_task(session)
+                if session.engine:
+                    session.engine.reset()
+                session.mode = "ptt"
+                session.engine = None
+                is_listening = False
+                audio_buffer = []
+                await websocket.send_json({
+                    "type": "session_stopped",
+                    "cancelled_response": cancelled,
+                })
+                await websocket.send_json({"type": "state", "state": "idle"})
+                logger.info("Session stopped (kill switch)")
+
             elif msg["type"] == "ping":
                 await websocket.send_json({"type": "pong"})
 
