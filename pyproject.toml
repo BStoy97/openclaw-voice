@@ -3,7 +3,7 @@ name = "openclaw-voice"
 version = "0.1.0"
 description = "Self-hosted browser-based voice interface for AI assistants"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.15"
 license = {text = "MIT"}
 authors = [
     {name = "Purple Horizons", email = "hello@purplehorizons.io"}
@@ -24,10 +24,11 @@ dependencies = [
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
     "numpy>=1.26.0",
-    "openai>=1.6.0",
+    "openai>=2.0.0,<3",
     "httpx>=0.26.0",
     "loguru>=0.7.2",
     "python-dotenv>=1.0.0",
+    "python-multipart>=0.0.8",
 ]
 
 [project.optional-dependencies]
@@ -35,7 +36,7 @@ stt = [
     "faster-whisper>=1.0.0",
 ]
 tts = [
-    "torch>=2.1.0",
+    "torch>=2.6.0",
     "torchaudio>=2.1.0",
 ]
 all = [
@@ -56,6 +57,9 @@ Issues = "https://github.com/Purple-Horizons/openclaw-voice/issues"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

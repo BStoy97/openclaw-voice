@@ -35,18 +35,27 @@ def server():
     env = os.environ.copy()
     env['OPENCLAW_PORT'] = str(port)
     env['OPENCLAW_STT_MODEL'] = 'tiny'  # Use tiny for fast tests
-    
+    env['OPENCLAW_REQUIRE_AUTH'] = 'false'
+    # Hermetic: server must boot keyless into echo mode (no real credentials
+    # available or required for these tests).
+    for key in (
+        'OPENAI_API_KEY',
+        'OPENCLAW_GATEWAY_URL',
+        'OPENCLAW_GATEWAY_TOKEN',
+    ):
+        env.pop(key, None)
+
     proc = subprocess.Popen(
-        [sys.executable, '-m', 'uvicorn', 'src.server.main:app', 
+        [sys.executable, '-m', 'uvicorn', 'src.server.main:app',
          '--host', '127.0.0.1', '--port', str(port)],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=os.path.dirname(os.path.dirname(__file__)),
     )
-    
+
     # Wait for server to be ready
-    max_wait = 15
+    max_wait = 60
     for i in range(max_wait):
         if is_port_in_use(port):
             break

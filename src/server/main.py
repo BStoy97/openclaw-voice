@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -29,6 +30,8 @@ from .backend import AIBackend
 from .vad import VoiceActivityDetector
 from .auth import token_manager, load_keys_from_env, APIKey
 from .text_utils import clean_for_speech
+
+load_dotenv()
 
 
 class Settings(BaseSettings):
@@ -57,8 +60,8 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     
     # OpenClaw Gateway (auto-detected from OPENCLAW_GATEWAY_URL + TOKEN)
-    openclaw_gateway_url: Optional[str] = None
-    openclaw_gateway_token: Optional[str] = None
+    gateway_url: Optional[str] = None
+    gateway_token: Optional[str] = None
     
     # Audio
     sample_rate: int = 16000
@@ -107,8 +110,8 @@ async def startup():
     
     # Initialize AI backend
     # Auto-detect OpenClaw gateway
-    gateway_url = settings.openclaw_gateway_url or os.getenv("OPENCLAW_GATEWAY_URL")
-    gateway_token = settings.openclaw_gateway_token or os.getenv("OPENCLAW_GATEWAY_TOKEN")
+    gateway_url = settings.gateway_url or os.getenv("OPENCLAW_GATEWAY_URL")
+    gateway_token = settings.gateway_token or os.getenv("OPENCLAW_GATEWAY_TOKEN")
     
     if gateway_url and gateway_token:
         # Use OpenClaw gateway (connects to Aria!)
@@ -147,7 +150,7 @@ async def startup():
 @app.get("/voice/")
 async def index():
     """Serve the demo page."""
-    return FileResponse("src/client/index.html")
+    return FileResponse(str(Path(__file__).parent.parent / "client" / "index.html"))
 
 
 @app.post("/api/keys")
