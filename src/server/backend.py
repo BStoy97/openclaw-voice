@@ -45,7 +45,15 @@ class AIBackend:
                 logger.error("openai package not installed")
         elif self.backend_type == "openclaw":
             # OpenClaw gateway uses OpenAI-compatible API
-            logger.info("OpenClaw gateway backend")
+            try:
+                from openai import AsyncOpenAI
+                self._client = AsyncOpenAI(
+                    api_key=self.api_key or "openclaw",  # Token goes here
+                    base_url=f"{self.url}/v1",
+                )
+                logger.info(f"✅ OpenClaw gateway client ready ({self.url})")
+            except ImportError:
+                logger.error("openai package not installed")
         else:
             logger.warning(f"Unknown backend type: {self.backend_type}")
     
@@ -59,7 +67,7 @@ class AIBackend:
         Returns:
             AI response text
         """
-        if self.backend_type == "openai" and self._client:
+        if self._client:
             return await self._chat_openai(user_message)
         else:
             # Fallback echo response
@@ -75,7 +83,7 @@ class AIBackend:
         Yields:
             Text chunks as they're generated
         """
-        if self.backend_type == "openai" and self._client:
+        if self._client:
             async for chunk in self._chat_openai_stream(user_message):
                 yield chunk
         else:
