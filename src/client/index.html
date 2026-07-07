@@ -832,6 +832,7 @@
     src.onended = () => {
       const i = playback.activeSources.indexOf(src);
       if (i !== -1) playback.activeSources.splice(i, 1);
+      if (playback.activeSources.length === 0) render(); // leave SPEAKING when queue drains
     };
   }
 
@@ -917,6 +918,14 @@
       case 'turn_started':
         S.currentTurnId = msg.turn_id;
         S.eotPending = false;
+        // User began a new turn while the previous reply may still be playing
+        // locally (server already finished sending it): silence it now —
+        // client-side barge-in for the playback-lag window.
+        if (isPlaybackActive()) {
+          stopPlaybackInstantly();
+          flashDevAid('barge-in: local playback flushed');
+        }
+        render();
         break;
       case 'eot_pending':
         S.eotPending = true;
@@ -1148,7 +1157,17 @@
     if (S.connState === 'connecting' && !S.sessionWanted) return 'idle';
     if (!S.sessionWanted) return 'stopped';
     if (S.held) return 'held';
+    // TTS synthesizes faster than realtime: the server returns to "listening"
+    // once all audio is *sent*, while local playback is still going. Show
+    // SPEAKING until the playback queue actually drains.
+    if (isPlaybackActive() && (S.serverState === 'listening' || S.serverState === 'idle')) {
+      return 'speaking';
+    }
     return S.serverState;
+  }
+
+  function isPlaybackActive(){
+    return playback.activeSources.length > 0;
   }
 
   function render(){
