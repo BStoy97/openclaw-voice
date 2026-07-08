@@ -1412,8 +1412,25 @@
    * ========================================================== */
   render();
   renderReasonList();
-  connectWS();
-  setInterval(() => { sendWS({ type: 'ping' }); }, 30000);
+
+  // Design-review mode: ?preview=listening|thinking|speaking|idle renders a
+  // display state with no mic, no WebSocket — for screenshots / variant picks.
+  const previewState = qs.get('preview');
+  if (previewState && ['idle','listening','thinking','speaking'].includes(previewState)) {
+    S.sessionWanted = true;
+    S.connState = 'connected';
+    S.serverState = previewState;
+    S.thinkingStart = performance.now();
+    S.lastUserUtterance = 'What time is it right now?';
+    S.replyBuffer = "It's 7:42 PM — and traffic on I-95 looks clear.";
+    hideStartOverlay();
+    // synthesize gentle mic energy so LISTENING visuals show their motion
+    setInterval(() => { S.micRMS = previewState === 'listening' ? (0.06 + 0.05 * Math.sin(performance.now() / 300)) : 0; }, 50);
+    render();
+  } else {
+    connectWS();
+    setInterval(() => { sendWS({ type: 'ping' }); }, 30000);
+  }
 
 })();
 </script>
