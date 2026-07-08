@@ -1,0 +1,14 @@
+{
+  "name": "OpenClaw Voice",
+  "short_name": "Voice",
+  "description": "Voice chat with your OpenClaw agent — hands-free, local STT",
+  "start_url": "/?mode=drive",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0d0d12",
+  "theme_color": "#0d0d12",
+  "icons": [
+    { "src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
