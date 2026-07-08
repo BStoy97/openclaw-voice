@@ -220,6 +220,9 @@
     color:#fff;
   }
   #stopBtn:active{background:linear-gradient(180deg,#c22323,#911a1a);}
+  #stopBtn.restart{background:linear-gradient(180deg,#2ecc71,#1f9e53);}
+  #stopBtn.restart:active{background:linear-gradient(180deg,#1f9e53,#177a40);}
+  #deskStopBtn.restart{background:linear-gradient(180deg,#2ecc71,#1f9e53);}
   #holdBtn{
     width:30%;
     background:linear-gradient(180deg,#3a3a44,#25252d);
@@ -893,6 +896,13 @@
     render();
   }
 
+  // STOP and the ring/desk-square are toggles: once stopped, the same
+  // control restarts the session (mirrors tapping the ball/ring).
+  function stopStartToggle(){
+    if (S.sessionWanted) killSwitch();
+    else beginSession();
+  }
+
   function toggleHold(){
     if (!S.sessionWanted) return;
     S.held = !S.held;
@@ -1069,8 +1079,8 @@
    * 10. Controls: STOP / HOLD (drive), strip buttons (desk),
    *     spacebar PTT (desk), long-press PTT (drive ring)
    * ========================================================== */
-  document.getElementById('stopBtn').addEventListener('click', killSwitch);
-  document.getElementById('deskStopBtn').addEventListener('click', killSwitch);
+  document.getElementById('stopBtn').addEventListener('click', stopStartToggle);
+  document.getElementById('deskStopBtn').addEventListener('click', stopStartToggle);
   document.getElementById('holdBtn').addEventListener('click', toggleHold);
   document.getElementById('deskMuteBtn').addEventListener('click', toggleHold);
 
@@ -1182,6 +1192,15 @@
     document.getElementById('holdBtn').textContent = S.held ? 'HELD' : 'HOLD';
     document.getElementById('deskMuteBtn').classList.toggle('mute-on', S.held);
     document.getElementById('deskMuteBtn').textContent = S.held ? 'MUTED' : 'MIC';
+
+    const stopped = !S.sessionWanted;
+    const stopBtn = document.getElementById('stopBtn');
+    stopBtn.classList.toggle('restart', stopped);
+    stopBtn.textContent = stopped ? 'START' : 'STOP';
+    const deskStop = document.getElementById('deskStopBtn');
+    deskStop.classList.toggle('restart', stopped);
+    deskStop.textContent = stopped ? '▶' : '■';
+    deskStop.title = stopped ? 'start session' : 'kill switch';
 
     document.getElementById('stripStateText').textContent = label;
   }
