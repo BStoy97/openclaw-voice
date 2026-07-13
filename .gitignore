@@ -14,3 +14,4 @@ build/
 
 # Model binaries (fetch via scripts/download_models.py)
 models/**/*.onnx
+models/voice-samples/*.wav
