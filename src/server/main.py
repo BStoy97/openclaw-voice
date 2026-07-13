@@ -13,9 +13,10 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 from dotenv import load_dotenv
@@ -30,6 +31,7 @@ from .tts import ChatterboxTTS
 from .backend import AIBackend
 from .vad import VoiceActivityDetector
 from .turn import (
+    BARGE_CANDIDATE,
     BARGE_IN,
     EOT_PENDING,
     TURN_COMMITTED,
@@ -442,6 +444,52 @@ def _park_session(session: "_SessionState") -> None:
     logger.info(f"Parked session for resume: client_id={client_id} grace={grace}s")
 
 
+# --- Transcribe-then-decide barge-in -----------------------------------------
+#
+# Field data (truck testing): while the agent speaks over Bluetooth, iOS echo
+# cancellation ducks the user's speech so hard that pure-VAD barge-in almost
+# never fires. The TurnEngine now emits BARGE_CANDIDATE (buffered audio) after
+# a short low-threshold speech run; we transcribe it and decide:
+#
+#   stop phrase heard  -> 'cancel'   kill playback, discard the audio
+#   >= 3 words         -> 'takeover' kill playback, the speech becomes the
+#                                    user's next turn (buffer seeds it)
+#   empty / 1-2 fillers -> 'ignore'  agent keeps talking
+#
+# The engine's own 1.2 s pure-VAD BARGE_IN remains as a fallback when
+# transcription is unavailable.
+
+_DEFAULT_STOP_PHRASES = TurnConfig().stop_phrase_list
+
+
+def _normalize_speech(text: str) -> str:
+    """Lowercase, strip punctuation (apostrophes kept), collapse whitespace."""
+    text = re.sub(r"[^\w\s']", " ", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def decide_barge(
+    text: str, stop_phrases: Optional[Sequence[str]] = None
+) -> str:
+    """Classify a barge-candidate transcript: 'cancel' | 'takeover' | 'ignore'.
+
+    Stop phrases match word-boundary-aware ("stop" never matches
+    "stopwatch") anywhere in the utterance. Anything else with >= 3 words
+    is a genuine talk-over; shorter fragments are treated as noise.
+    """
+    normalized = _normalize_speech(text or "")
+    if not normalized:
+        return "ignore"
+    phrases = _DEFAULT_STOP_PHRASES if stop_phrases is None else stop_phrases
+    for phrase in phrases:
+        p = _normalize_speech(phrase)
+        if p and re.search(r"\b" + re.escape(p) + r"\b", normalized):
+            return "cancel"
+    if len(normalized.split()) >= 3:
+        return "takeover"
+    return "ignore"
+
+
 async def _cancel_response_task(session: _SessionState) -> bool:
     """Cancel the in-flight response pipeline, if any. Returns True if one
     was actually cancelled."""
@@ -498,6 +546,54 @@ def _launch_response(
     session.response_task = asyncio.create_task(_task())
 
 
+async def _handle_barge_candidate(
+    websocket: WebSocket, session: _SessionState, event
+) -> None:
+    """Transcribe a BARGE_CANDIDATE's buffered audio and resolve it.
+
+    Deliberately does NOT resolve the candidate when transcription is
+    unavailable or fails — leaving it unresolved lets the engine's 1.2 s
+    pure-VAD BARGE_IN fallback fire.
+    """
+    engine = session.engine
+    if engine is None:
+        return
+    if stt is None or event.audio is None or len(event.audio) == 0:
+        return  # unresolved -> pure-VAD fallback handles it
+    try:
+        text = await stt.transcribe(event.audio)
+    except Exception as e:  # noqa: BLE001 - degrade to the fallback path
+        logger.debug(f"Barge-candidate transcription failed: {e}")
+        return
+    decision = decide_barge(text, engine.config.stop_phrase_list)
+    now = time.monotonic()
+
+    if decision == "cancel":
+        # Stop phrase: kill playback, discard the audio (not a new turn).
+        if await _cancel_response_task(session):
+            await websocket.send_json({"type": "tts_cancelled"})
+        await websocket.send_json({"type": "state", "state": "listening"})
+        engine.resolve_barge("cancel", now)
+        engine.set_agent_responding(False)
+        logger.info(f"Stop-phrase barge: '{text.strip()}'")
+    elif decision == "takeover":
+        # Genuine talk-over: the buffered speech becomes the new user turn.
+        if await _cancel_response_task(session):
+            await websocket.send_json({"type": "tts_cancelled"})
+        engine.resolve_barge("takeover", now)
+        engine.set_agent_responding(False)
+        session.turn_counter += 1
+        session.current_turn_id = session.turn_counter
+        await websocket.send_json({
+            "type": "turn_started",
+            "turn_id": session.current_turn_id,
+        })
+        logger.info(f"Takeover barge: '{text.strip()}'")
+    else:
+        engine.resolve_barge("ignore", now)
+        logger.debug(f"Ignored barge candidate: '{text.strip()}'")
+
+
 async def _handle_turn_events(
     websocket: WebSocket, session: _SessionState, events
 ) -> None:
@@ -515,7 +611,10 @@ async def _handle_turn_events(
                 "type": "eot_pending",
                 "turn_id": session.current_turn_id,
             })
+        elif event.type == BARGE_CANDIDATE:
+            await _handle_barge_candidate(websocket, session, event)
         elif event.type == BARGE_IN:
+            # Legacy pure-VAD fallback (candidates went unresolved).
             logger.info("Barge-in: cancelling agent response")
             if await _cancel_response_task(session):
                 await websocket.send_json({"type": "tts_cancelled"})
@@ -634,6 +733,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         "semantic_enabled": session.engine.semantic_active,
                         "barge_in_min_speech_secs": turn_config.barge_in_min_speech_secs,
                         "semantic_threshold": turn_config.semantic_threshold,
+                        "barge_candidate_secs": turn_config.barge_candidate_secs,
+                        "barge_gap_frames": turn_config.barge_gap_frames,
+                        "barge_responding_threshold": turn_config.barge_responding_threshold,
+                        "stop_phrases": turn_config.stop_phrase_list,
                     },
                 })
                 await websocket.send_json({"type": "state", "state": "listening"})

@@ -219,6 +219,11 @@ class TestContinuousMode:
             assert started["type"] == "session_started"
             assert started["mode"] == "continuous"
             assert started["config"]["patience_ceiling_secs"] <= 20.0
+            # Barge-in tuning (transcribe-then-decide) is reported too.
+            assert started["config"]["barge_candidate_secs"] > 0
+            assert started["config"]["barge_gap_frames"] >= 1
+            assert 0 <= started["config"]["barge_responding_threshold"] <= 1
+            assert "stop" in started["config"]["stop_phrases"]
 
             state = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
             assert state == {"type": "state", "state": "listening"}
@@ -472,6 +477,80 @@ class TestSessionResume:
             started = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
             assert started["resumed"] is False
             assert started["history_turns"] == 0
+
+
+class TestDecideBarge:
+    """Unit tests for the transcribe-then-decide barge classifier
+    (src.server.main.decide_barge), run in-process — the async candidate
+    handler is a thin wrapper around this pure function."""
+
+    @staticmethod
+    def _decide(text, stop_phrases=None):
+        from src.server.main import decide_barge
+        return decide_barge(text, stop_phrases)
+
+    # --- stop phrases -> cancel ------------------------------------------
+
+    def test_stop_word_alone(self):
+        assert self._decide("stop") == "cancel"
+
+    def test_stop_with_punctuation_and_case(self):
+        assert self._decide("Stop!") == "cancel"
+        assert self._decide("STOP.") == "cancel"
+
+    def test_stop_phrase_inside_sentence(self):
+        assert self._decide("please stop talking right now") == "cancel"
+        assert self._decide("no no wait a second") == "cancel"
+
+    def test_multiword_stop_phrases(self):
+        assert self._decide("hold on") == "cancel"
+        assert self._decide("Hold on, hold on!") == "cancel"
+        assert self._decide("okay stop") == "cancel"
+        assert self._decide("that's enough") == "cancel"
+        assert self._decide("never mind") == "cancel"
+        assert self._decide("nevermind") == "cancel"
+
+    def test_stop_phrase_beats_takeover_word_count(self):
+        # 5 words, but contains a stop phrase -> cancel wins.
+        assert self._decide("hey can you please stop") == "cancel"
+
+    # --- word boundaries ---------------------------------------------------
+
+    def test_stopwatch_does_not_match_stop(self):
+        # "stopwatch" must NOT trigger the "stop" phrase; 6 words -> takeover
+        assert self._decide("I checked my stopwatch yesterday morning") == "takeover"
+
+    def test_single_word_stopwatch_ignored(self):
+        assert self._decide("stopwatch") == "ignore"
+
+    def test_waiter_does_not_match_wait(self):
+        assert self._decide("the waiter brought our food") == "takeover"
+
+    # --- takeover ------------------------------------------------------------
+
+    def test_three_plus_words_takeover(self):
+        assert self._decide("tell me more") == "takeover"
+        assert self._decide("what about the weather") == "takeover"
+
+    # --- ignore ---------------------------------------------------------------
+
+    def test_empty_and_whitespace_ignored(self):
+        assert self._decide("") == "ignore"
+        assert self._decide("   ") == "ignore"
+        assert self._decide(None) == "ignore"
+
+    def test_short_filler_ignored(self):
+        assert self._decide("uh") == "ignore"
+        assert self._decide("um yeah") == "ignore"
+        assert self._decide("Hmm...") == "ignore"
+
+    # --- custom per-session stop phrases -------------------------------------
+
+    def test_custom_stop_phrases(self):
+        assert self._decide("banana", ["banana"]) == "cancel"
+        # Default phrases no longer apply when a custom list is given.
+        assert self._decide("stop", ["banana"]) == "ignore"
+        assert self._decide("red light", ["red light"]) == "cancel"
 
 
 class TestSessionRegistryUnit:

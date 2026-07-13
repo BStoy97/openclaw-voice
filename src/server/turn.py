@@ -10,8 +10,25 @@ State machine (per WebSocket connection):
       └──────commit (semantic / ceiling / timeout / manual)──────┘
 
     AGENT_RESPONDING: entered via set_agent_responding(True) while the
-    response pipeline (thinking + speaking) runs; sustained user speech
-    there emits BARGE_IN and drops straight into USER_SPEAKING.
+    response pipeline (thinking + speaking) runs.  User speech there is
+    evaluated with a lower VAD threshold (barge_responding_threshold —
+    in-car echo cancellation attenuates double-talk) and accumulated into
+    a rolling barge buffer (~1 s preroll + the speech run, capped at a
+    5 s tail).  After barge_candidate_secs of accumulated speech the
+    engine emits BARGE_CANDIDATE carrying the buffered audio WITHOUT
+    changing state; the caller transcribes it and answers via
+    resolve_barge():
+
+        'cancel'   — stop phrase heard: clear the buffer, suppress further
+                     candidates, stay AGENT_RESPONDING until
+                     set_agent_responding(False)
+        'takeover' — real talk-over: transition to USER_SPEAKING seeded
+                     with the barge buffer as the new turn's frames
+        'ignore'   — noise/filler: clear run + buffer, stay put
+
+    Pure-VAD fallback: if a speech run reaches 1.2 s without any candidate
+    being resolved (transcription unavailable), the engine emits legacy
+    BARGE_IN and drops straight into USER_SPEAKING as before.
 
 Semantic end-of-turn uses pipecat-ai's smart-turn-v3 ONNX model
 (BSD-2-Clause).  Preprocessing/inference adapted with attribution from
@@ -39,6 +56,7 @@ USER_SPEECH_STARTED = "user_speech_started"
 EOT_PENDING = "eot_pending"
 TURN_COMMITTED = "turn_committed"
 BARGE_IN = "barge_in"
+BARGE_CANDIDATE = "barge_candidate"
 
 # TURN_COMMITTED reasons
 REASON_SEMANTIC = "semantic"   # smart-turn gate said the utterance is complete
@@ -84,6 +102,13 @@ class TurnConfig:
     semantic_enabled: bool = True         # use the smart-turn gate
     barge_in_min_speech_secs: float = 0.5 # sustained speech to interrupt the agent
     semantic_threshold: float = 0.5       # P(turn complete) needed to commit
+    barge_candidate_secs: float = 0.35    # accumulated speech (AGENT_RESPONDING) to emit BARGE_CANDIDATE
+    barge_gap_frames: int = 8             # non-speech frames tolerated inside a barge run (~256 ms)
+    barge_responding_threshold: float = 0.35  # VAD prob counted as speech during AGENT_RESPONDING (AEC attenuates)
+    stop_phrases: str = (                 # comma-separated; parsed to stop_phrase_list
+        "stop,hold on,wait,be quiet,quiet,shut up,that's enough,"
+        "okay stop,ok stop,pause,never mind,nevermind,interrupt"
+    )
 
     def __post_init__(self):
         self.clamp()
@@ -105,6 +130,17 @@ class TurnConfig:
         )
         self.barge_in_min_speech_secs = max(0.1, float(self.barge_in_min_speech_secs))
         self.semantic_threshold = min(max(float(self.semantic_threshold), 0.0), 1.0)
+        self.barge_candidate_secs = max(0.1, float(self.barge_candidate_secs))
+        self.barge_gap_frames = max(1, int(self.barge_gap_frames))
+        self.barge_responding_threshold = min(
+            max(float(self.barge_responding_threshold), 0.0), 1.0
+        )
+        self.stop_phrases = str(self.stop_phrases)
+        # Parsed once here; per-session overrides flow through from_env ->
+        # _parse (str passthrough) -> this clamp, so they re-parse too.
+        self.stop_phrase_list: List[str] = [
+            p.strip().lower() for p in self.stop_phrases.split(",") if p.strip()
+        ]
 
     @classmethod
     def from_env(cls, overrides: Optional[dict] = None) -> "TurnConfig":
@@ -139,6 +175,8 @@ class TurnConfig:
                 return str(value).strip().lower() in _TRUTHY
             if field.type in (int, "int"):
                 return int(value)
+            if field.type in (str, "str"):
+                return str(value)
             return float(value)
         except (TypeError, ValueError):
             logger.warning(f"Ignoring invalid turn config value {field.name}={value!r}")
@@ -246,7 +284,8 @@ class TurnEngine:
 
     _PREROLL_SECS = 1.0            # audio kept before speech onset
     _RESUME_SPEECH_FRAMES = 2      # speech frames to cancel PENDING_EOT
-    _BARGE_GAP_TOLERANCE = 3       # non-speech frames tolerated inside a barge run
+    _BARGE_FALLBACK_SECS = 1.2     # unresolved speech run before legacy BARGE_IN
+    _BARGE_BUFFER_MAX_SECS = 5.0   # rolling barge buffer tail cap
     _NOISE_EMA_ALPHA = 0.05
     _NOISE_PROB_CEILING = 0.3      # frames below this VAD prob feed the noise EMA
 
@@ -286,6 +325,10 @@ class TurnEngine:
         self._resume_speech_run = 0
         self._barge_speech_run = 0
         self._barge_nonspeech_run = 0
+        self._barge_fallback_run = 0
+        self._barge_candidates = 0
+        self._barge_buffer: List[np.ndarray] = []
+        self._barge_suppressed = False
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -311,16 +354,45 @@ class TurnEngine:
         """Signal that the agent response pipeline (thinking/speaking) is
         active, so incoming speech is evaluated for barge-in."""
         self.agent_responding = active
+        self._barge_suppressed = False
         if active:
             self.state = TurnState.AGENT_RESPONDING
             self._turn_frames = []
             self._recent_speech.clear()
-            self._barge_speech_run = 0
-            self._barge_nonspeech_run = 0
+            self._reset_barge()
         elif self.state == TurnState.AGENT_RESPONDING:
             # Barge-in already moved us to USER_SPEAKING; don't clobber that.
+            # NOTE: the barge buffer is deliberately NOT cleared here — a
+            # pending BARGE_CANDIDATE may still be resolved as 'takeover'
+            # after the response task's cleanup already flipped this flag.
             self.state = TurnState.IDLE
             self._recent_speech.clear()
+
+    def resolve_barge(self, decision: str, now: float) -> None:
+        """Answer an emitted BARGE_CANDIDATE (transcribe-then-decide).
+
+        'cancel'   — stop phrase: clear buffer, suppress further candidates;
+                     state is left alone (caller follows up with
+                     set_agent_responding(False)).
+        'takeover' — genuine talk-over: become USER_SPEAKING with the barge
+                     buffer seeded as the new turn's frames. Emits nothing —
+                     the caller already knows and does its own bookkeeping.
+        'ignore'   — noise/filler: clear run + buffer, keep listening for
+                     the next barge attempt.
+        """
+        if decision == "takeover":
+            buffer = self._barge_buffer
+            self._reset_barge()
+            self._start_turn(now)
+            if buffer:
+                self._turn_frames = buffer  # includes ~1 s preroll
+        elif decision == "cancel":
+            self._reset_barge()
+            self._barge_suppressed = True
+        elif decision == "ignore":
+            self._reset_barge()
+        else:
+            raise ValueError(f"Unknown barge decision: {decision!r}")
 
     def force_commit(self) -> List[TurnEvent]:
         """Commit whatever turn audio has accumulated (legacy stop_listening)."""
@@ -339,8 +411,8 @@ class TurnEngine:
         self._last_speech_time = 0.0
         self._next_semantic_check = 0.0
         self._resume_speech_run = 0
-        self._barge_speech_run = 0
-        self._barge_nonspeech_run = 0
+        self._reset_barge()
+        self._barge_suppressed = False
         self.last_semantic_prob = None
         if hasattr(self.vad, "reset"):
             self.vad.reset()
@@ -376,7 +448,7 @@ class TurnEngine:
         self._preroll.append(frame)
 
         if self.state == TurnState.AGENT_RESPONDING:
-            events.extend(self._handle_barge_frame(is_speech, now))
+            events.extend(self._handle_barge_frame(frame, prob, now))
         elif self.state == TurnState.IDLE:
             self._recent_speech.append(is_speech)
             if sum(self._recent_speech) >= self.config.min_speech_frames:
@@ -417,21 +489,77 @@ class TurnEngine:
 
         return events
 
-    def _handle_barge_frame(self, is_speech: bool, now: float) -> List[TurnEvent]:
+    def _handle_barge_frame(
+        self, frame: np.ndarray, prob: float, now: float
+    ) -> List[TurnEvent]:
+        """Barge detection while the agent is speaking.
+
+        Speech frames (>= barge_responding_threshold; lower than
+        start_threshold because in-car AEC attenuates double-talk) grow a
+        rolling buffer seeded from the ~1 s preroll.  Every
+        barge_candidate_secs of accumulated speech emits BARGE_CANDIDATE
+        with the buffered audio for the caller to transcribe and resolve;
+        an unresolved run reaching _BARGE_FALLBACK_SECS falls back to the
+        legacy pure-VAD BARGE_IN.
+        """
+        if self._barge_suppressed:
+            return []
+        is_speech = prob >= self.config.barge_responding_threshold
         if is_speech:
+            if not self._barge_buffer:
+                # Preroll already contains the current frame (appended in
+                # _process_frame before dispatch).
+                self._barge_buffer = list(self._preroll)
+            else:
+                self._barge_buffer.append(frame)
             self._barge_speech_run += 1
+            self._barge_fallback_run += 1
             self._barge_nonspeech_run = 0
         else:
+            if self._barge_buffer:
+                self._barge_buffer.append(frame)
             self._barge_nonspeech_run += 1
-            if self._barge_nonspeech_run >= self._BARGE_GAP_TOLERANCE:
+            if self._barge_nonspeech_run >= self.config.barge_gap_frames:
+                # Run died. Keep the buffer only if a candidate is already
+                # in flight (it keeps growing across candidates within one
+                # agent response); otherwise start fresh next burst.
                 self._barge_speech_run = 0
-        needed = max(1, int(round(self.config.barge_in_min_speech_secs / FRAME_SECS)))
-        if self._barge_speech_run >= needed:
+                self._barge_fallback_run = 0
+                if self._barge_candidates == 0:
+                    self._barge_buffer = []
+        # Cap the buffer to a trailing window (frames are FRAME_SIZE each).
+        max_frames = max(1, int(self._BARGE_BUFFER_MAX_SECS / FRAME_SECS))
+        if len(self._barge_buffer) > max_frames:
+            del self._barge_buffer[: len(self._barge_buffer) - max_frames]
+
+        fallback_frames = max(1, int(round(self._BARGE_FALLBACK_SECS / FRAME_SECS)))
+        if self._barge_fallback_run >= fallback_frames:
+            # Legacy pure-VAD fallback: no one resolved our candidates
+            # (transcription unavailable) — barge in directly.
+            buffer = self._barge_buffer
+            self._reset_barge()
             self._start_turn(now)
-            self._barge_speech_run = 0
-            self._barge_nonspeech_run = 0
+            if buffer:
+                self._turn_frames = buffer
             return [TurnEvent(BARGE_IN), TurnEvent(USER_SPEECH_STARTED)]
+
+        candidate_frames = max(
+            1, int(round(self.config.barge_candidate_secs / FRAME_SECS))
+        )
+        if self._barge_speech_run >= candidate_frames:
+            self._barge_speech_run = 0  # re-arm: repeated attempts re-emit
+            self._barge_candidates += 1
+            return [
+                TurnEvent(BARGE_CANDIDATE, audio=np.concatenate(self._barge_buffer))
+            ]
         return []
+
+    def _reset_barge(self) -> None:
+        self._barge_speech_run = 0
+        self._barge_nonspeech_run = 0
+        self._barge_fallback_run = 0
+        self._barge_candidates = 0
+        self._barge_buffer = []
 
     def _start_turn(self, now: float) -> None:
         self.state = TurnState.USER_SPEAKING

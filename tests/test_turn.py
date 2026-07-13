@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.server.turn import (  # noqa: E402
+    BARGE_CANDIDATE,
     BARGE_IN,
     EOT_PENDING,
     REASON_CEILING,
@@ -186,31 +187,156 @@ class TestBargeIn:
         assert engine.state == TurnState.AGENT_RESPONDING
 
         events, t = drive(engine, [0.9] * 6, 0.0)  # ~0.19 s
-        assert not [e for e in events if e.type == BARGE_IN]
+        assert not [e for e in events if e.type in (BARGE_IN, BARGE_CANDIDATE)]
         events, _ = drive(engine, [0.0] * 20, t)
-        assert not [e for e in events if e.type == BARGE_IN]
+        assert not [e for e in events if e.type in (BARGE_IN, BARGE_CANDIDATE)]
         assert engine.state == TurnState.AGENT_RESPONDING
 
-    def test_sustained_speech_triggers_barge_in(self):
-        """(d) >= 0.5 s sustained speech during agent response barges in."""
+    def test_sustained_speech_emits_candidate_not_state_change(self):
+        """(d) >= barge_candidate_secs sustained speech during agent
+        response emits BARGE_CANDIDATE with buffered audio, WITHOUT
+        changing state (main.py transcribes and decides)."""
         engine = make_engine(FakeGate(0.9))
         engine.set_agent_responding(True)
 
         events, _ = drive(engine, [0.9] * frames_for(0.6), 0.0)
+        candidates = [e for e in events if e.type == BARGE_CANDIDATE]
+        assert len(candidates) == 1
+        assert isinstance(candidates[0].audio, np.ndarray)
+        assert len(candidates[0].audio) > 0
+        assert not [e for e in events if e.type == BARGE_IN]
+        assert not [e for e in events if e.type == USER_SPEECH_STARTED]
+        assert engine.state == TurnState.AGENT_RESPONDING
+
+    def test_unresolved_run_falls_back_to_legacy_barge_in(self):
+        """A 1.2 s speech run with no resolve_barge() falls back to the
+        pure-VAD BARGE_IN exactly as before (transcription unavailable)."""
+        engine = make_engine(FakeGate(0.9))
+        engine.set_agent_responding(True)
+
+        events, _ = drive(engine, [0.9] * frames_for(1.3), 0.0)
         types = [e.type for e in events]
         assert BARGE_IN in types
         assert USER_SPEECH_STARTED in types
+        # Candidates were emitted along the way (at 0.35 s cadence).
+        assert types.count(BARGE_CANDIDATE) >= 2
         assert engine.state == TurnState.USER_SPEAKING
+        # The barged turn is seeded with the buffered speech.
+        committed = engine.force_commit()
+        assert len(committed) == 1
+        assert len(committed[0].audio) > 0
 
         # main.py cancels the response and clears the flag; the new turn
         # must survive that.
         engine.set_agent_responding(False)
-        assert engine.state == TurnState.USER_SPEAKING
 
     def test_no_barge_when_agent_idle(self):
         engine = make_engine(FakeGate(0.9))
         events, _ = drive(engine, [0.9] * frames_for(0.6), 0.0)
-        assert not [e for e in events if e.type == BARGE_IN]
+        assert not [e for e in events if e.type in (BARGE_IN, BARGE_CANDIDATE)]
+
+
+class TestBargeCandidate:
+    """Transcribe-then-decide barge-in: candidate emission + resolve paths."""
+
+    def test_candidate_at_low_prob_with_gaps(self):
+        """0.35 s of accumulated speech at prob 0.4 — below start_threshold
+        (0.5) but above barge_responding_threshold (0.35) — with a gap up
+        to barge_gap_frames still emits a candidate (in-car AEC ducking)."""
+        engine = make_engine(FakeGate(0.9))
+        assert engine.config.start_threshold == 0.5  # 0.4 would NOT start a turn
+        engine.set_agent_responding(True)
+
+        # 5 speech frames, 7-frame gap (< barge_gap_frames=8), 6 more speech
+        probs = [0.4] * 5 + [0.0] * 7 + [0.4] * 6  # 11 speech frames ~0.35 s
+        events, _ = drive(engine, probs, 0.0)
+        candidates = [e for e in events if e.type == BARGE_CANDIDATE]
+        assert len(candidates) == 1
+        # Buffer spans the whole run (speech + gap frames)
+        assert len(candidates[0].audio) >= 11 * FRAME_SIZE
+        assert engine.state == TurnState.AGENT_RESPONDING
+
+    def test_gap_beyond_tolerance_resets_run(self):
+        engine = make_engine(FakeGate(0.9))
+        engine.set_agent_responding(True)
+
+        probs = [0.4] * 5 + [0.0] * 9 + [0.4] * 6  # gap 9 >= 8: run dies
+        events, _ = drive(engine, probs, 0.0)
+        assert not [e for e in events if e.type in (BARGE_CANDIDATE, BARGE_IN)]
+        assert engine.state == TurnState.AGENT_RESPONDING
+
+    def test_repeated_candidates_reemit_with_growing_buffer(self):
+        """Each additional barge_candidate_secs of speech re-emits, and the
+        buffer keeps growing across candidates within one response."""
+        engine = make_engine(FakeGate(0.9))
+        engine.set_agent_responding(True)
+
+        events, _ = drive(engine, [0.4] * 23, 0.0)  # 2 x ~0.35 s runs
+        candidates = [e for e in events if e.type == BARGE_CANDIDATE]
+        assert len(candidates) == 2
+        assert len(candidates[1].audio) > len(candidates[0].audio)
+
+    def test_resolve_takeover_seeds_turn_with_buffer(self):
+        engine = make_engine(FakeGate(0.9))
+        engine.set_agent_responding(True)
+
+        # Drive exactly to the candidate boundary so the buffer and the
+        # candidate audio are identical when we resolve.
+        n = max(1, int(round(engine.config.barge_candidate_secs / FRAME_SECS)))
+        events, t = drive(engine, [0.4] * n, 0.0)
+        candidate = next(e for e in events if e.type == BARGE_CANDIDATE)
+
+        engine.resolve_barge("takeover", t)
+        assert engine.state == TurnState.USER_SPEAKING
+        # main.py clears the flag right after; the new turn must survive.
+        engine.set_agent_responding(False)
+        assert engine.state == TurnState.USER_SPEAKING
+
+        committed = engine.force_commit()
+        assert len(committed) == 1
+        # Seeded exactly with the barge buffer (== the candidate audio,
+        # since nothing was fed in between).
+        assert len(committed[0].audio) == len(candidate.audio)
+
+    def test_resolve_cancel_suppresses_until_agent_done(self):
+        engine = make_engine(FakeGate(0.9))
+        engine.set_agent_responding(True)
+
+        events, t = drive(engine, [0.4] * 12, 0.0)
+        assert [e for e in events if e.type == BARGE_CANDIDATE]
+
+        engine.resolve_barge("cancel", t)
+        assert engine.state == TurnState.AGENT_RESPONDING
+
+        # Further speech while cancelled emits nothing (suppressed).
+        events, t = drive(engine, [0.9] * 20, t)
+        assert events == []
+
+        engine.set_agent_responding(False)
+        assert engine.state == TurnState.IDLE
+
+        # Suppression is lifted: normal turn-taking works again.
+        events, _ = drive(engine, [0.9] * 10, t)
+        assert [e.type for e in events] == [USER_SPEECH_STARTED]
+
+    def test_resolve_ignore_allows_new_candidate(self):
+        engine = make_engine(FakeGate(0.9))
+        engine.set_agent_responding(True)
+
+        events, t = drive(engine, [0.4] * 12, 0.0)
+        assert [e for e in events if e.type == BARGE_CANDIDATE]
+
+        engine.resolve_barge("ignore", t)
+        assert engine.state == TurnState.AGENT_RESPONDING
+
+        # A fresh run re-emits a candidate.
+        events, _ = drive(engine, [0.4] * 12, t)
+        assert [e for e in events if e.type == BARGE_CANDIDATE]
+
+    def test_resolve_unknown_decision_raises(self):
+        engine = make_engine(FakeGate(0.9))
+        with pytest.raises(ValueError):
+            engine.resolve_barge("maybe", 0.0)
 
 
 class TestConfig:
@@ -240,6 +366,43 @@ class TestConfig:
         assert config.patience_ceiling_secs == 20.0
         assert config.min_silence_secs == 1.8  # default kept
         assert config.start_threshold == 0.7
+
+    def test_barge_defaults(self):
+        config = TurnConfig()
+        assert config.barge_candidate_secs == 0.35
+        assert config.barge_gap_frames == 8
+        assert config.barge_responding_threshold == 0.35
+        for phrase in ("stop", "hold on", "wait", "that's enough", "nevermind"):
+            assert phrase in config.stop_phrase_list
+
+    def test_barge_fields_clamped(self):
+        assert TurnConfig(barge_candidate_secs=0.01).barge_candidate_secs == 0.1
+        assert TurnConfig(barge_gap_frames=0).barge_gap_frames == 1
+        assert TurnConfig(barge_responding_threshold=1.5).barge_responding_threshold == 1.0
+        assert TurnConfig(barge_responding_threshold=-1).barge_responding_threshold == 0.0
+
+    def test_barge_fields_from_env(self, monkeypatch):
+        monkeypatch.setenv("OPENCLAW_TURN_BARGE_CANDIDATE_SECS", "0.5")
+        monkeypatch.setenv("OPENCLAW_TURN_BARGE_GAP_FRAMES", "12")
+        monkeypatch.setenv("OPENCLAW_TURN_BARGE_RESPONDING_THRESHOLD", "0.2")
+        monkeypatch.setenv("OPENCLAW_TURN_STOP_PHRASES", "halt, Cease ,desist")
+        config = TurnConfig.from_env()
+        assert config.barge_candidate_secs == 0.5
+        assert config.barge_gap_frames == 12
+        assert config.barge_responding_threshold == 0.2
+        assert config.stop_phrase_list == ["halt", "cease", "desist"]
+
+    def test_stop_phrases_session_override_str_passthrough(self):
+        """Per-session override of a str field flows through _parse."""
+        config = TurnConfig.from_env(overrides={
+            "stop_phrases": "Red Light, green light",
+            "barge_responding_threshold": 0.25,
+        })
+        assert config.stop_phrase_list == ["red light", "green light"]
+        assert config.barge_responding_threshold == 0.25
+        # Non-str values are coerced, not dropped.
+        config = TurnConfig.from_env(overrides={"stop_phrases": 123})
+        assert config.stop_phrase_list == ["123"]
 
 
 class TestFallbackAndManual:
