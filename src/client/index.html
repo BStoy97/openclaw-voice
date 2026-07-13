@@ -487,6 +487,19 @@
   const explicitMode = qs.get('mode');
   const explicitVariant = qs.get('variant');
 
+  // Lead-in pad (ms) before the first audio_chunk of each turn — tunable
+  // from the URL for in-car testing. Default 250ms, capped at 1500ms.
+  const LEADIN_MS = (() => {
+    const raw = parseInt(qs.get('leadin'), 10);
+    if (!Number.isFinite(raw) || raw < 0) return 250;
+    return Math.min(raw, 1500);
+  })();
+
+  // Design-review mode (?preview=<state>): no mic, no WebSocket, no audio —
+  // referenced early so lifecycle hardening below can't accidentally spin
+  // up an AudioContext / keep-alive stream for a screenshot session.
+  const PREVIEW_MODE = ['idle','listening','thinking','speaking'].includes(qs.get('preview'));
+
   const S = {
     mode: (explicitMode === 'drive' || explicitMode === 'desk')
       ? explicitMode
@@ -593,6 +606,26 @@
   }
 
   /* ============================================================
+   * 1a. Client identity: persistent resume key
+   * ========================================================== */
+  function getClientId(){
+    let id = null;
+    try { id = localStorage.getItem('ocv_client_id'); } catch(e){}
+    if (!id) {
+      id = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+            const r = Math.random() * 16 | 0;
+            const v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+          });
+      try { localStorage.setItem('ocv_client_id', id); } catch(e){}
+    }
+    return id;
+  }
+  const CLIENT_ID = getClientId();
+
+  /* ============================================================
    * 2. WebSocket connection + exponential-backoff reconnect
    * ========================================================== */
   let ws = null;
@@ -652,12 +685,22 @@
     backoffMs = Math.min(backoffMs * 2, BACKOFF_CAP);
   }
 
+  // Bypass the current backoff timer — used on iOS foreground/BFCache
+  // restore, where we want to reconnect immediately rather than wait out
+  // whatever backoff accrued while the page was suspended.
+  function forceReconnect(){
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    backoffMs = 1000;
+    connectWS();
+  }
+
   function sendWS(obj){
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }
 
   function sendSessionStart(){
-    sendWS({ type: 'session_start', mode: 'continuous' });
+    sendWS({ type: 'session_start', mode: 'continuous', client_id: CLIENT_ID });
   }
 
   function setConnState(v){
@@ -801,6 +844,9 @@
     analyser: null,
     nextStartTime: 0,
     activeSources: [],
+    keepAliveSource: null,     // the single running keep-alive loop, or null
+    keepAliveBuffer: null,     // cached ~1s noise buffer, built once per ctx
+    leadinAppliedTurn: null,   // turn_id the lead-in pad was already applied to
   };
 
   function ensurePlaybackCtx(){
@@ -815,10 +861,61 @@
     playback.gain = gain;
     playback.analyser = analyser;
     playback.nextStartTime = ctx.currentTime;
+
+    // iOS/BT can force the context (or its whole audio session) into
+    // 'suspended' outside of our control — e.g. a route change or an OS
+    // interruption. While the session is still wanted, claw it back:
+    // resume and restart the keep-alive loop (dropping the stale source
+    // reference first so only one loop ever runs).
+    ctx.onstatechange = () => {
+      if (!S.sessionWanted) return;
+      if (ctx.state === 'suspended') {
+        stopKeepAlive();
+        ctx.resume().then(startKeepAlive).catch(()=>{});
+      } else if (ctx.state === 'running' && !playback.keepAliveSource) {
+        startKeepAlive();
+      }
+    };
     return ctx;
   }
 
-  function queueAudioChunk(base64Data, sampleRate){
+  // ---- Silent keep-alive output stream (BT channel pinning + iOS survival) ----
+  // Continuously plays very-quiet-but-nonzero noise through the playback
+  // graph while a session is active. True silence lets iOS/car-BT idle or
+  // tear down the audio route; a nonzero floor keeps it pinned open so TTS
+  // doesn't have to renegotiate HFP (and clip its own first words) every turn.
+  const KEEPALIVE_AMPLITUDE = 0.0008; // ~ -62 dBFS: inaudible on car speakers, nonzero on the wire
+
+  function buildKeepAliveBuffer(ctx){
+    const sr = ctx.sampleRate;
+    const len = sr; // ~1s loop
+    const buffer = ctx.createBuffer(1, len, sr);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * KEEPALIVE_AMPLITUDE;
+    return buffer;
+  }
+
+  function startKeepAlive(){
+    const ctx = ensurePlaybackCtx();
+    if (playback.keepAliveSource) return; // guard: only one keep-alive source ever runs
+    if (!playback.keepAliveBuffer) playback.keepAliveBuffer = buildKeepAliveBuffer(ctx);
+    const src = ctx.createBufferSource();
+    src.buffer = playback.keepAliveBuffer;
+    src.loop = true;
+    src.connect(playback.gain);
+    try { src.start(); } catch(e){ return; }
+    playback.keepAliveSource = src;
+  }
+
+  function stopKeepAlive(){
+    if (playback.keepAliveSource) {
+      try { playback.keepAliveSource.stop(0); } catch(e){}
+      try { playback.keepAliveSource.disconnect(); } catch(e){}
+      playback.keepAliveSource = null;
+    }
+  }
+
+  function queueAudioChunk(base64Data, sampleRate, turnId){
     const ctx = ensurePlaybackCtx();
     if (ctx.state === 'suspended') { ctx.resume().catch(()=>{}); }
     const int16 = base64ToInt16(base64Data);
@@ -834,7 +931,14 @@
     src.buffer = buffer;
     src.connect(playback.gain);
 
-    const startAt = Math.max(ctx.currentTime, playback.nextStartTime);
+    let startAt = Math.max(ctx.currentTime, playback.nextStartTime);
+    // Lead-in pad: only ahead of the FIRST chunk of a given turn. Belt and
+    // suspenders on top of the keep-alive stream — delays speech slightly so
+    // nothing lands during any residual BT/HFP spin-up.
+    if (turnId !== undefined && turnId !== null && playback.leadinAppliedTurn !== turnId) {
+      playback.leadinAppliedTurn = turnId;
+      startAt = Math.max(startAt, ctx.currentTime + LEADIN_MS / 1000);
+    }
     src.start(startAt);
     playback.nextStartTime = startAt + buffer.duration;
 
@@ -852,6 +956,8 @@
       try { src.disconnect(); } catch(e){}
     }
     if (playback.ctx) playback.nextStartTime = playback.ctx.currentTime;
+    // Deliberately does NOT touch the keep-alive source — barge-in / turn
+    // transitions should keep the route pinned open, not tear it down.
   }
 
   /* ============================================================
@@ -879,6 +985,8 @@
     try {
       ensurePlaybackCtx();
       if (playback.ctx.state === 'suspended') await playback.ctx.resume().catch(()=>{});
+      playback.leadinAppliedTurn = null;
+      startKeepAlive(); // inside the user gesture, so iOS/BT grant the route up front
       await startMic();
       requestWakeLock();
       S.sessionWanted = true;
@@ -890,12 +998,14 @@
     } catch (err) {
       showStartError('Microphone error: ' + (err && err.message ? err.message : err));
       S.sessionWanted = false;
+      stopKeepAlive();
       showStartOverlay();
     }
   }
 
   function killSwitch(){
     stopPlaybackInstantly();
+    stopKeepAlive(); // total silence after STOP
     S.sessionWanted = false;
     S.held = false;
     S.serverState = 'idle';
@@ -916,14 +1026,52 @@
     render();
   }
 
+  /* ------------------------------------------------------------
+   * 6a. iOS lifecycle hardening: screen-lock / backgrounding kills
+   * the page (P1). On return to foreground — via visibilitychange
+   * or a BFCache 'pageshow' restore — resume both AudioContexts,
+   * restart the keep-alive loop, and reconnect the WS immediately
+   * (bypassing whatever backoff had accrued) if it died meanwhile.
+   * ---------------------------------------------------------- */
+  async function onAppForeground(){
+    if (PREVIEW_MODE || !S.sessionWanted) return;
+    if (playback.ctx && playback.ctx.state === 'suspended') {
+      try { await playback.ctx.resume(); } catch(e){}
+    }
+    startKeepAlive();
+    if (mic.ctx && mic.ctx.state === 'suspended') {
+      try { await mic.ctx.resume(); } catch(e){}
+    }
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      forceReconnect();
+    }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') onAppForeground();
+  });
+  window.addEventListener('pageshow', () => { onAppForeground(); });
+
   /* ============================================================
    * 7. Server message handling
    * ========================================================== */
   function handleMessage(msg){
     switch (msg.type) {
-      case 'session_started':
+      case 'session_started': {
         S.effectiveConfig = msg.config || null;
+        // `resumed` may be absent until the server lands resume support —
+        // treat absent/undefined as false (fresh session) defensively.
+        const resumed = msg.resumed === true;
+        if (resumed) {
+          const turns = (typeof msg.history_turns === 'number') ? msg.history_turns
+            : (typeof msg.turn_count === 'number') ? msg.turn_count
+            : (typeof msg.turns === 'number') ? msg.turns
+            : null;
+          flashDevAid('resumed session' + (turns != null ? ' · ' + turns + ' turns' : ''));
+        } else {
+          clearTranscript();
+        }
         break;
+      }
       case 'state':
         if (msg.state === 'thinking' && S.serverState !== 'thinking') {
           S.thinkingStart = performance.now();
@@ -973,7 +1121,7 @@
         render();
         break;
       case 'audio_chunk':
-        queueAudioChunk(msg.data, msg.sample_rate);
+        queueAudioChunk(msg.data, msg.sample_rate, msg.turn_id !== undefined ? msg.turn_id : S.currentTurnId);
         break;
       case 'tts_cancelled':
         stopPlaybackInstantly();
@@ -1037,6 +1185,14 @@
     body.innerHTML = renderInline(text);
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
     if (done) { streamingBubbleEl = null; streamingBubbleTurn = null; }
+  }
+
+  // Fresh (non-resumed) session: clear the transcript pane so a new
+  // conversation doesn't inherit stale bubbles from before.
+  function clearTranscript(){
+    transcriptEl.innerHTML = '';
+    streamingBubbleEl = null;
+    streamingBubbleTurn = null;
   }
 
   /* ============================================================
@@ -1440,9 +1596,11 @@
   renderReasonList();
 
   // Design-review mode: ?preview=listening|thinking|speaking|idle renders a
-  // display state with no mic, no WebSocket — for screenshots / variant picks.
+  // display state with no mic, no WebSocket, no audio — for screenshots /
+  // variant picks. (PREVIEW_MODE is computed early so lifecycle hardening
+  // can't accidentally start the keep-alive stream during a preview.)
   const previewState = qs.get('preview');
-  if (previewState && ['idle','listening','thinking','speaking'].includes(previewState)) {
+  if (PREVIEW_MODE) {
     S.sessionWanted = true;
     S.connState = 'connected';
     S.serverState = previewState;
