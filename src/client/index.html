@@ -946,7 +946,10 @@
     src.onended = () => {
       const i = playback.activeSources.indexOf(src);
       if (i !== -1) playback.activeSources.splice(i, 1);
-      if (playback.activeSources.length === 0) render(); // leave SPEAKING when queue drains
+      if (playback.activeSources.length === 0) {
+        render(); // leave SPEAKING when queue drains
+        notifyPlaybackDone();
+      }
     };
   }
 
@@ -1117,7 +1120,11 @@
         break;
       case 'response_complete':
         S.replyBuffer = msg.text || S.replyBuffer;
+        S.responseCompleteTurn = msg.turn_id !== undefined ? msg.turn_id : S.currentTurnId;
         updateStreamingBubble(S.replyBuffer, msg.turn_id, true);
+        // If playback already drained before response_complete arrived
+        // (short replies), report it now.
+        if (!isPlaybackActive()) notifyPlaybackDone();
         render();
         break;
       case 'audio_chunk':
@@ -1341,6 +1348,15 @@
 
   function isPlaybackActive(){
     return playback.activeSources.length > 0;
+  }
+
+  // Tell the server the speakers actually finished — it holds the barge-in
+  // window open until then (TTS sends far faster than realtime playback).
+  function notifyPlaybackDone(){
+    if (S.responseCompleteTurn === undefined || S.responseCompleteTurn === null) return;
+    if (isPlaybackActive()) return;
+    sendWS({ type: 'playback_done', turn_id: S.responseCompleteTurn });
+    S.responseCompleteTurn = null;
   }
 
   function render(){

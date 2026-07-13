@@ -240,11 +240,14 @@ async def run_turn(
     turn_id: Optional[int] = None,
     continuous: bool = False,
     t_commit: Optional[float] = None,
-) -> None:
+    stop_phrases=None,
+) -> float:
     """One full response turn: STT → streamed LLM → sentence-level TTS.
 
     Used by both the legacy stop_listening path and continuous-mode commits.
     Cancellation-safe: a barge-in cancels the surrounding task at any await.
+    Returns the seconds of TTS audio sent (0.0 if none) so the caller can
+    bound its wait for client playback.
     """
     t_commit = t_commit if t_commit is not None else time.monotonic()
     sample_rate = getattr(tts, "sample_rate", 24000) if tts else 24000
@@ -266,7 +269,20 @@ async def run_turn(
     logger.info(f"Transcript: {transcript}")
 
     if not transcript.strip():
-        return
+        return 0.0
+
+    # A committed turn that is nothing but a stop phrase ("stop", "hold on")
+    # is leftover interrupt intent — usually speech that landed just after
+    # the barge window closed. Never forward it to the LLM as a prompt.
+    if (
+        continuous
+        and stop_phrases
+        and len(transcript.split()) <= 4
+        and decide_barge(transcript, stop_phrases) == "cancel"
+    ):
+        logger.info(f"Bare stop phrase committed as turn; discarding: '{transcript.strip()}'")
+        await websocket.send_json(_tag({"type": "tts_cancelled"}))
+        return 0.0
 
     if continuous:
         await websocket.send_json(_tag({"type": "state", "state": "thinking"}))
@@ -275,10 +291,11 @@ async def run_turn(
     sentence_buffer = ""
     t_llm_first: Optional[float] = None
     t_first_audio: Optional[float] = None
+    audio_bytes_sent = 0
 
     async def speak(text: str) -> None:
         """Synthesize one sentence and stream it as audio_chunk messages."""
-        nonlocal t_first_audio
+        nonlocal t_first_audio, audio_bytes_sent
         speech_text = clean_for_speech(text)
         if not speech_text:
             return
@@ -290,6 +307,7 @@ async def run_turn(
                     await websocket.send_json(
                         _tag({"type": "state", "state": "speaking"})
                     )
+            audio_bytes_sent += len(audio_chunk)
             await websocket.send_json(_tag({
                 "type": "audio_chunk",
                 "data": base64.b64encode(audio_chunk).decode(),
@@ -355,6 +373,8 @@ async def run_turn(
             "total_ms": round((t_done - t_commit) * 1000),
         }))
 
+    return audio_bytes_sent / 2 / sample_rate  # int16 → seconds of audio sent
+
 
 class _SessionState:
     """Per-WebSocket-connection state."""
@@ -367,6 +387,7 @@ class _SessionState:
         self.turn_counter = 0
         self.current_turn_id: Optional[int] = None
         self.client_id: Optional[str] = None
+        self.playback_done: Optional[asyncio.Event] = None
 
 
 # --- Reconnect session continuity -------------------------------------------
@@ -513,17 +534,31 @@ def _launch_response(
     turn_id = session.current_turn_id
     engine = session.engine
     engine.set_agent_responding(True)
+    session.playback_done = asyncio.Event()
 
     async def _task():
         try:
-            await run_turn(
+            sent_secs = await run_turn(
                 websocket,
                 audio,
                 session.conn_backend,
                 turn_id=turn_id,
                 continuous=True,
                 t_commit=t_commit,
+                stop_phrases=engine.config.stop_phrase_list,
             )
+            # TTS synthesizes faster than realtime, so sending finishes long
+            # before the client's speakers do. Keep the barge window open
+            # until the client reports playback_done (or a bounded estimate
+            # elapses) so "stop" works for the WHOLE audible reply.
+            if sent_secs and sent_secs > 0:
+                try:
+                    await asyncio.wait_for(
+                        session.playback_done.wait(),
+                        timeout=max(3.0, sent_secs + 3.0),
+                    )
+                except asyncio.TimeoutError:
+                    pass
             await websocket.send_json({"type": "state", "state": "listening"})
         except asyncio.CancelledError:
             raise
@@ -570,16 +605,18 @@ async def _handle_barge_candidate(
 
     if decision == "cancel":
         # Stop phrase: kill playback, discard the audio (not a new turn).
-        if await _cancel_response_task(session):
-            await websocket.send_json({"type": "tts_cancelled"})
+        # Always send tts_cancelled — even when the send pipeline already
+        # finished, the client still has queued audio to flush.
+        await _cancel_response_task(session)
+        await websocket.send_json({"type": "tts_cancelled"})
         await websocket.send_json({"type": "state", "state": "listening"})
         engine.resolve_barge("cancel", now)
         engine.set_agent_responding(False)
         logger.info(f"Stop-phrase barge: '{text.strip()}'")
     elif decision == "takeover":
         # Genuine talk-over: the buffered speech becomes the new user turn.
-        if await _cancel_response_task(session):
-            await websocket.send_json({"type": "tts_cancelled"})
+        await _cancel_response_task(session)
+        await websocket.send_json({"type": "tts_cancelled"})
         engine.resolve_barge("takeover", now)
         engine.set_agent_responding(False)
         session.turn_counter += 1
@@ -780,6 +817,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             "type": "vad_status",
                             "speech_detected": has_speech,
                         })
+
+            elif msg["type"] == "playback_done":
+                if session.playback_done is not None:
+                    session.playback_done.set()
 
             elif msg["type"] == "session_stop":
                 # Kill switch: cancel any in-flight response, drop buffered

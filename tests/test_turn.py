@@ -201,7 +201,9 @@ class TestBargeIn:
 
         events, _ = drive(engine, [0.9] * frames_for(0.6), 0.0)
         candidates = [e for e in events if e.type == BARGE_CANDIDATE]
-        assert len(candidates) == 1
+        # cadence-derived: one candidate per barge_candidate_secs of speech
+        expected = int(0.6 / engine.config.barge_candidate_secs)
+        assert len(candidates) == expected
         assert isinstance(candidates[0].audio, np.ndarray)
         assert len(candidates[0].audio) > 0
         assert not [e for e in events if e.type == BARGE_IN]
@@ -218,7 +220,7 @@ class TestBargeIn:
         types = [e.type for e in events]
         assert BARGE_IN in types
         assert USER_SPEECH_STARTED in types
-        # Candidates were emitted along the way (at 0.35 s cadence).
+        # Candidates were emitted along the way (at barge_candidate_secs cadence).
         assert types.count(BARGE_CANDIDATE) >= 2
         assert engine.state == TurnState.USER_SPEAKING
         # The barged turn is seeded with the buffered speech.
@@ -369,7 +371,7 @@ class TestConfig:
 
     def test_barge_defaults(self):
         config = TurnConfig()
-        assert config.barge_candidate_secs == 0.35
+        assert config.barge_candidate_secs == 0.25
         assert config.barge_gap_frames == 8
         assert config.barge_responding_threshold == 0.35
         for phrase in ("stop", "hold on", "wait", "that's enough", "nevermind"):
