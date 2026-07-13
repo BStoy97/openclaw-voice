@@ -322,5 +322,251 @@ class TestContinuousMode:
             assert state_after is not None
 
 
+class TestSessionResume:
+    """Reconnect session continuity: client_id resume registry."""
+
+    @pytest.mark.asyncio
+    async def test_first_connect_not_resumed(self, server):
+        """A brand-new client_id never seen before -> resumed:false."""
+        import websockets
+
+        ws_url, _ = server
+        client_id = "resume-test-fresh"
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({
+                "type": "session_start",
+                "mode": "continuous",
+                "client_id": client_id,
+            }))
+            started = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+            assert started["type"] == "session_started"
+            assert started["resumed"] is False
+            assert started["history_turns"] == 0
+            await asyncio.wait_for(ws.recv(), timeout=5)  # state: listening
+            # Explicitly stop so this client_id doesn't leak into the
+            # registry and affect other tests in this module.
+            await ws.send(json.dumps({"type": "session_stop"}))
+            await asyncio.wait_for(ws.recv(), timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_reconnect_same_client_id_resumes(self, server):
+        """Disconnect (without session_stop) then reconnect with the same
+        client_id within the grace window -> resumed:true."""
+        import websockets
+
+        ws_url, _ = server
+        client_id = "resume-test-reconnect"
+
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({
+                "type": "session_start",
+                "mode": "continuous",
+                "client_id": client_id,
+            }))
+            started = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+            assert started["resumed"] is False
+        # `async with` exit closes the socket -> server parks the session.
+
+        # Give the server a moment to process the disconnect and park.
+        await asyncio.sleep(0.5)
+
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({
+                "type": "session_start",
+                "mode": "continuous",
+                "client_id": client_id,
+            }))
+            started = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+            assert started["type"] == "session_started"
+            assert started["resumed"] is True
+            await asyncio.wait_for(ws.recv(), timeout=5)  # state: listening
+
+            await ws.send(json.dumps({"type": "session_stop"}))
+            await asyncio.wait_for(ws.recv(), timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_reconnect_different_client_id_not_resumed(self, server):
+        """A different client_id never resumes another session's state,
+        even though the first session_start's client_id remains parked."""
+        import websockets
+
+        ws_url, _ = server
+        client_id_a = "resume-test-diff-a"
+        client_id_b = "resume-test-diff-b"
+
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({
+                "type": "session_start",
+                "mode": "continuous",
+                "client_id": client_id_a,
+            }))
+            await asyncio.wait_for(ws.recv(), timeout=15)
+        # `async with` exit closes the socket -> client_id_a gets parked.
+
+        await asyncio.sleep(0.5)
+
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({
+                "type": "session_start",
+                "mode": "continuous",
+                "client_id": client_id_b,
+            }))
+            started = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+            assert started["resumed"] is False
+            await asyncio.wait_for(ws.recv(), timeout=5)  # state: listening
+
+            # Clean up so client_id_b/a don't leak into other tests.
+            await ws.send(json.dumps({"type": "session_stop"}))
+            await asyncio.wait_for(ws.recv(), timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_session_stop_clears_registry_for_resume(self, server):
+        """session_stop (kill switch) removes the client_id entry, so a
+        later reconnect with the same id is NOT resumed."""
+        import websockets
+
+        ws_url, _ = server
+        client_id = "resume-test-stopped"
+
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({
+                "type": "session_start",
+                "mode": "continuous",
+                "client_id": client_id,
+            }))
+            await asyncio.wait_for(ws.recv(), timeout=15)  # session_started
+            await asyncio.wait_for(ws.recv(), timeout=5)   # state: listening
+
+            await ws.send(json.dumps({"type": "session_stop"}))
+            stopped = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+            assert stopped["type"] == "session_stopped"
+        # Socket closes after an explicit session_stop -> must NOT be
+        # re-parked (client_id was forgotten by session_stop).
+
+        await asyncio.sleep(0.5)
+
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({
+                "type": "session_start",
+                "mode": "continuous",
+                "client_id": client_id,
+            }))
+            started = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+            assert started["resumed"] is False
+            await asyncio.wait_for(ws.recv(), timeout=5)  # state: listening
+            await ws.send(json.dumps({"type": "session_stop"}))
+            await asyncio.wait_for(ws.recv(), timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_legacy_session_start_without_client_id(self, server):
+        """No client_id at all -> legacy behavior, resumed:false, and the
+        connection never touches the resume registry."""
+        import websockets
+
+        ws_url, _ = server
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({
+                "type": "session_start",
+                "mode": "continuous",
+            }))
+            started = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+            assert started["resumed"] is False
+            assert started["history_turns"] == 0
+
+
+class TestSessionRegistryUnit:
+    """Direct unit tests of the resume registry's purge/cap logic, run
+    in-process against src.server.main (no server/websocket needed)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        from src.server import main as server_main
+        server_main._SESSION_REGISTRY.clear()
+        yield
+        server_main._SESSION_REGISTRY.clear()
+
+    def test_grace_secs_default_and_clamp(self, monkeypatch):
+        from src.server import main as server_main
+
+        monkeypatch.delenv("OPENCLAW_SESSION_GRACE_SECS", raising=False)
+        assert server_main._session_grace_secs() == 600.0
+
+        monkeypatch.setenv("OPENCLAW_SESSION_GRACE_SECS", "-5")
+        assert server_main._session_grace_secs() == 0.0
+
+        monkeypatch.setenv("OPENCLAW_SESSION_GRACE_SECS", "999999")
+        assert server_main._session_grace_secs() == 3600.0
+
+        monkeypatch.setenv("OPENCLAW_SESSION_GRACE_SECS", "45")
+        assert server_main._session_grace_secs() == 45.0
+
+        monkeypatch.setenv("OPENCLAW_SESSION_GRACE_SECS", "not-a-number")
+        assert server_main._session_grace_secs() == 600.0
+
+    def test_purge_expired_removes_only_expired(self):
+        from src.server import main as server_main
+
+        reg = server_main._SESSION_REGISTRY
+        reg["alive"] = {"session": object(), "expires_at": 1000.0}
+        reg["dead_a"] = {"session": object(), "expires_at": 10.0}
+        reg["dead_b"] = {"session": object(), "expires_at": 50.0}
+
+        server_main._purge_expired_registry(now=100.0)
+
+        assert set(reg.keys()) == {"alive"}
+
+    def test_purge_expired_boundary_is_expired(self):
+        """expires_at == now counts as expired (<=)."""
+        from src.server import main as server_main
+
+        reg = server_main._SESSION_REGISTRY
+        reg["exact"] = {"session": object(), "expires_at": 100.0}
+
+        server_main._purge_expired_registry(now=100.0)
+
+        assert "exact" not in reg
+
+    def test_cap_drops_oldest_first(self):
+        from src.server import main as server_main
+
+        reg = server_main._SESSION_REGISTRY
+        for i in range(server_main.SESSION_REGISTRY_CAP + 5):
+            reg[f"client-{i}"] = {"session": object(), "expires_at": float(i)}
+
+        assert len(reg) == server_main.SESSION_REGISTRY_CAP + 5
+        server_main._cap_session_registry()
+
+        assert len(reg) == server_main.SESSION_REGISTRY_CAP
+        # The 5 oldest (lowest-indexed, inserted first) must be gone.
+        for i in range(5):
+            assert f"client-{i}" not in reg
+        # The most recently inserted entries survive.
+        for i in range(5, server_main.SESSION_REGISTRY_CAP + 5):
+            assert f"client-{i}" in reg
+
+    def test_park_session_noop_without_client_id(self):
+        from src.server import main as server_main
+
+        session = server_main._SessionState()
+        session.client_id = None
+        server_main._park_session(session)
+        assert len(server_main._SESSION_REGISTRY) == 0
+
+    def test_park_session_registers_with_expiry(self, monkeypatch):
+        from src.server import main as server_main
+
+        monkeypatch.setenv("OPENCLAW_SESSION_GRACE_SECS", "10")
+        session = server_main._SessionState()
+        session.client_id = "unit-park-test"
+
+        before = time.monotonic()
+        server_main._park_session(session)
+        after = time.monotonic()
+
+        entry = server_main._SESSION_REGISTRY["unit-park-test"]
+        assert entry["session"] is session
+        assert before + 10 <= entry["expires_at"] <= after + 10
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

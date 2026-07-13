@@ -364,6 +364,82 @@ class _SessionState:
         self.response_task: Optional[asyncio.Task] = None
         self.turn_counter = 0
         self.current_turn_id: Optional[int] = None
+        self.client_id: Optional[str] = None
+
+
+# --- Reconnect session continuity -------------------------------------------
+#
+# Field data: mobile WebSocket drops (iOS screen-lock suspend, radio dead
+# zones) used to blow away conversation_history on every reconnect — one
+# 30-min phone test produced 29 gateway sessions. Clients that pass a
+# persistent client_id in session_start can now resume the parked
+# _SessionState (and its conn_backend conversation history) within a grace
+# window instead of starting a brand-new conversation.
+
+SESSION_REGISTRY_CAP = 32
+SESSION_GRACE_SECS_DEFAULT = 600.0
+SESSION_GRACE_SECS_MAX = 3600.0
+
+# client_id -> {"session": _SessionState, "expires_at": float (monotonic)}
+_SESSION_REGISTRY: dict = {}
+
+
+def _session_grace_secs() -> float:
+    """Grace window (seconds) a disconnected session stays resumable.
+
+    Read fresh from the environment on every call (not cached at import)
+    so it can be tuned without a process restart, and so unit tests can
+    exercise it via monkeypatched env vars.
+    """
+    raw = os.getenv("OPENCLAW_SESSION_GRACE_SECS")
+    try:
+        val = float(raw) if raw is not None else SESSION_GRACE_SECS_DEFAULT
+    except (TypeError, ValueError):
+        val = SESSION_GRACE_SECS_DEFAULT
+    return max(0.0, min(val, SESSION_GRACE_SECS_MAX))
+
+
+def _purge_expired_registry(now: Optional[float] = None) -> None:
+    """Lazy sweep: drop registry entries past their expiry.
+
+    Called on every session_start (and before parking a new entry) so the
+    registry never needs a background task.
+    """
+    now = time.monotonic() if now is None else now
+    expired = [
+        cid for cid, entry in _SESSION_REGISTRY.items()
+        if entry["expires_at"] <= now
+    ]
+    for cid in expired:
+        del _SESSION_REGISTRY[cid]
+
+
+def _cap_session_registry() -> None:
+    """Enforce the max registry size, dropping the oldest-parked entries
+    first. Plain dict insertion order tracks park order here since entries
+    are only ever inserted (never reordered) by `_park_session`."""
+    while len(_SESSION_REGISTRY) > SESSION_REGISTRY_CAP:
+        oldest_id = next(iter(_SESSION_REGISTRY))
+        del _SESSION_REGISTRY[oldest_id]
+
+
+def _park_session(session: "_SessionState") -> None:
+    """Park a disconnected session's state in the resume registry.
+
+    No-op if the connection never adopted a client_id (legacy / non-resuming
+    clients get fresh state on every reconnect, as before).
+    """
+    client_id = session.client_id
+    if not client_id:
+        return
+    _purge_expired_registry()
+    grace = _session_grace_secs()
+    _SESSION_REGISTRY[client_id] = {
+        "session": session,
+        "expires_at": time.monotonic() + grace,
+    }
+    _cap_session_registry()
+    logger.info(f"Parked session for resume: client_id={client_id} grace={grace}s")
 
 
 async def _cancel_response_task(session: _SessionState) -> bool:
@@ -506,17 +582,49 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if msg["type"] == "session_start":
                 # Server-driven continuous mode: per-connection turn engine.
+                #
+                # Optional resume: a client that sends a persistent client_id
+                # and reconnects within the grace window gets its parked
+                # _SessionState back (conn_backend + conversation history
+                # intact) instead of starting a fresh conversation.
+                client_id = msg.get("client_id")
+                if not isinstance(client_id, str) or not client_id.strip():
+                    client_id = None
+
+                _purge_expired_registry()
+                resumed = False
+                history_turns = 0
+                if client_id:
+                    entry = _SESSION_REGISTRY.pop(client_id, None)
+                    if entry is not None:
+                        resumed = True
+                        session = entry["session"]
+                        # Defensively cancel any stale response pipeline —
+                        # the old websocket it was bound to is gone.
+                        await _cancel_response_task(session)
+                        session.response_task = None
+                        if session.conn_backend is not None:
+                            history_turns = (
+                                len(session.conn_backend.conversation_history) // 2
+                            )
+                session.client_id = client_id
+
                 overrides = msg.get("config")
                 turn_config = TurnConfig.from_env(
                     overrides if isinstance(overrides, dict) else None
                 )
                 session.mode = "continuous"
+                # Always a fresh TurnEngine: VAD state, turn timers and
+                # config must not carry over across a reconnect — only the
+                # AI conversation history (on conn_backend) does.
                 session.engine = TurnEngine(config=turn_config)
                 is_listening = False
                 audio_buffer = []
                 await websocket.send_json({
                     "type": "session_started",
                     "mode": "continuous",
+                    "resumed": resumed,
+                    "history_turns": history_turns,
                     "config": {
                         "start_threshold": turn_config.start_threshold,
                         "min_speech_frames": turn_config.min_speech_frames,
@@ -572,10 +680,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif msg["type"] == "session_stop":
                 # Kill switch: cancel any in-flight response, drop buffered
-                # turn audio, and leave continuous mode.
+                # turn audio, and leave continuous mode. Explicit stop means
+                # the user wants a clean end, not a resumable session — drop
+                # any parked registry entry and forget the client_id so a
+                # later disconnect doesn't re-park it.
                 cancelled = await _cancel_response_task(session)
                 if session.engine:
                     session.engine.reset()
+                if session.client_id:
+                    _SESSION_REGISTRY.pop(session.client_id, None)
+                    session.client_id = None
                 session.mode = "ptt"
                 session.engine = None
                 is_listening = False
@@ -597,6 +711,10 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
     finally:
         await _cancel_response_task(session)
+        session.response_task = None
+        # Park for possible resume (no-op if this connection never adopted
+        # a client_id — legacy clients keep today's fresh-state behavior).
+        _park_session(session)
 
 
 # Serve static files for client
