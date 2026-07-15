@@ -185,6 +185,15 @@ async def startup():
             api_key=settings.openai_api_key or os.getenv("OPENAI_API_KEY"),
         )
     
+    # Warm up STT: the first CTranslate2 call JIT-initializes kernels and
+    # was costing the first real turn ~2-4s extra ("slow to get going").
+    try:
+        t0 = time.monotonic()
+        await stt.transcribe(np.zeros(8000, dtype=np.float32))
+        logger.info(f"STT warm-up done in {time.monotonic() - t0:.1f}s")
+    except Exception as e:
+        logger.warning(f"STT warm-up failed (non-fatal): {e}")
+
     # Initialize VAD
     logger.info("Loading VAD model")
     vad = VoiceActivityDetector()
@@ -277,6 +286,7 @@ async def run_turn(
     continuous: bool = False,
     t_commit: Optional[float] = None,
     stop_phrases=None,
+    silence_secs: Optional[float] = None,
 ) -> float:
     """One full response turn: STT → streamed LLM → sentence-level TTS.
 
@@ -399,17 +409,37 @@ async def run_turn(
 
     if continuous:
         t_done = time.monotonic()
+        stt_ms = round((t_transcript - t_commit) * 1000)
+        llm_ttft_ms = (
+            round((t_llm_first - t_transcript) * 1000)
+            if t_llm_first is not None else None
+        )
+        tts_first_ms = (
+            round((t_first_audio - (t_llm_first or t_transcript)) * 1000)
+            if t_first_audio is not None else None
+        )
+        commit_to_audio_ms = (
+            round((t_first_audio - t_commit) * 1000)
+            if t_first_audio is not None else None
+        )
+        # Perceived gap = user's silence before the engine committed
+        # + commit-to-first-audio. THE number for "how long until it talks".
+        perceived_ms = (
+            round(silence_secs * 1000) + commit_to_audio_ms
+            if (silence_secs is not None and commit_to_audio_ms is not None)
+            else None
+        )
+        voice_log("turn_metrics", turn_id=turn_id, stt_ms=stt_ms,
+                  llm_ttft_ms=llm_ttft_ms, tts_first_chunk_ms=tts_first_ms,
+                  silence_before_commit_ms=(round(silence_secs * 1000) if silence_secs is not None else None),
+                  commit_to_audio_ms=commit_to_audio_ms,
+                  perceived_gap_ms=perceived_ms)
         await websocket.send_json(_tag({
             "type": "turn_metrics",
-            "stt_ms": round((t_transcript - t_commit) * 1000),
-            "llm_ttft_ms": (
-                round((t_llm_first - t_transcript) * 1000)
-                if t_llm_first is not None else None
-            ),
-            "tts_first_chunk_ms": (
-                round((t_first_audio - (t_llm_first or t_transcript)) * 1000)
-                if t_first_audio is not None else None
-            ),
+            "stt_ms": stt_ms,
+            "llm_ttft_ms": llm_ttft_ms,
+            "tts_first_chunk_ms": tts_first_ms,
+            "perceived_gap_ms": perceived_ms,
             "total_ms": round((t_done - t_commit) * 1000),
         }))
 
@@ -583,7 +613,8 @@ async def _cancel_response_task(session: _SessionState) -> bool:
 
 
 def _launch_response(
-    websocket: WebSocket, session: _SessionState, audio: np.ndarray, t_commit: float
+    websocket: WebSocket, session: _SessionState, audio: np.ndarray, t_commit: float,
+    silence_secs: Optional[float] = None,
 ) -> None:
     """Start the response pipeline as a cancellable background task."""
     turn_id = session.current_turn_id
@@ -601,6 +632,7 @@ def _launch_response(
                 continuous=True,
                 t_commit=t_commit,
                 stop_phrases=engine.config.stop_phrase_list,
+                silence_secs=silence_secs,
             )
             # TTS synthesizes faster than realtime, so sending finishes long
             # before the client's speakers do. Keep the barge window open
@@ -748,7 +780,8 @@ async def _handle_turn_events(
                 f"(reason={event.reason}, {len(event.audio)} samples)"
             )
             if event.audio is not None and len(event.audio) > 0:
-                _launch_response(websocket, session, event.audio, t_commit)
+                _launch_response(websocket, session, event.audio, t_commit,
+                                 silence_secs=event.silence_secs)
             else:
                 await websocket.send_json({"type": "state", "state": "listening"})
 

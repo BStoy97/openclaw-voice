@@ -77,6 +77,7 @@ class TurnEvent:
     type: str
     reason: Optional[str] = None
     audio: Optional[np.ndarray] = None
+    silence_secs: Optional[float] = None  # user-silence at commit (perceived-gap math)
 
 
 # --------------------------------------------------------------------------- #
@@ -470,7 +471,7 @@ class TurnEngine:
                 else:
                     # Gate unavailable: legacy-ish fixed silence commit.
                     if silence >= self.config.min_silence_secs * 2:
-                        events.append(self._commit(REASON_TIMEOUT))
+                        events.append(self._commit(REASON_TIMEOUT, now))
         elif self.state == TurnState.PENDING_EOT:
             self._turn_frames.append(frame)
             if is_speech:
@@ -484,7 +485,7 @@ class TurnEngine:
                 self._resume_speech_run = 0
                 silence = now - self._last_speech_time
                 if silence >= self.config.patience_ceiling_secs:
-                    events.append(self._commit(REASON_CEILING))
+                    events.append(self._commit(REASON_CEILING, now))
                 elif now >= self._next_semantic_check:
                     events.extend(self._semantic_check(now))
 
@@ -580,16 +581,19 @@ class TurnEngine:
             return []
         self.last_semantic_prob = prob
         if prob > self.config.semantic_threshold:
-            return [self._commit(REASON_SEMANTIC)]
+            return [self._commit(REASON_SEMANTIC, now)]
         return []
 
-    def _commit(self, reason: str) -> TurnEvent:
+    def _commit(self, reason: str, now: Optional[float] = None) -> TurnEvent:
         audio = self._turn_audio()
         self.state = TurnState.IDLE
         self._turn_frames = []
         self._recent_speech.clear()
         self._resume_speech_run = 0
-        return TurnEvent(TURN_COMMITTED, reason=reason, audio=audio)
+        silence = None
+        if now is not None and self._last_speech_time:
+            silence = max(0.0, now - self._last_speech_time)
+        return TurnEvent(TURN_COMMITTED, reason=reason, audio=audio, silence_secs=silence)
 
     def _turn_audio(self) -> np.ndarray:
         if not self._turn_frames:
