@@ -17,7 +17,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from src.server.turn import (  # noqa: E402
+from src.server.turn import (
+    EOT_KEYWORD_CANDIDATE,  # noqa: E402
     BARGE_CANDIDATE,
     BARGE_IN,
     EOT_PENDING,
@@ -341,6 +342,43 @@ class TestBargeCandidate:
         engine = make_engine(FakeGate(0.9))
         with pytest.raises(ValueError):
             engine.resolve_barge("maybe", 0.0)
+
+
+class TestEotKeyword:
+    """Radio-style 'over' — early keyword candidate + instant commit."""
+
+    def test_candidate_after_brief_silence(self):
+        engine = make_engine(FakeGate(0.1))  # gate would NOT commit (incomplete)
+        # speech run, then 0.5s silence (>= eot_keyword_check_secs 0.4)
+        events, t = drive(engine, [0.9] * 20, 0.0)
+        assert engine.state == TurnState.USER_SPEAKING
+        events, t = drive(engine, [0.0] * 16, t)  # ~0.5s silence
+        kw = [e for e in events if e.type == EOT_KEYWORD_CANDIDATE]
+        assert len(kw) == 1  # exactly one check per pause
+        assert kw[0].audio is not None and len(kw[0].audio) > 0
+        # more silence: no re-check without new speech
+        events, t = drive(engine, [0.0] * 10, t)
+        assert not [e for e in events if e.type == EOT_KEYWORD_CANDIDATE]
+        # new speech re-arms
+        events, t = drive(engine, [0.9] * 10, t)
+        events, t = drive(engine, [0.0] * 16, t)
+        assert [e for e in events if e.type == EOT_KEYWORD_CANDIDATE]
+
+    def test_commit_keyword_commits_with_reason(self):
+        engine = make_engine(FakeGate(0.1))
+        _, t = drive(engine, [0.9] * 20, 0.0)
+        events = engine.commit_keyword(t)
+        assert len(events) == 1
+        assert events[0].type == TURN_COMMITTED
+        assert events[0].reason == "keyword"
+        assert len(events[0].audio) > 0
+        assert engine.state == TurnState.IDLE
+
+    def test_disabled_keyword_no_candidates(self):
+        engine = make_engine(FakeGate(0.1), eot_keyword="")
+        _, t = drive(engine, [0.9] * 20, 0.0)
+        events, _ = drive(engine, [0.0] * 30, t)
+        assert not [e for e in events if e.type == EOT_KEYWORD_CANDIDATE]
 
 
 class TestConfig:

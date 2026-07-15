@@ -327,6 +327,19 @@ class TestContinuousMode:
             assert state_after is not None
 
 
+class TestStripTrailingKeyword:
+    def test_strips_variants(self):
+        from src.server.main import strip_trailing_keyword as stk
+        assert stk("Check the weather, over", "over") == "Check the weather"
+        assert stk("Check the weather. Over.", "over") == "Check the weather"
+        assert stk("Is the meeting over", "over") == "Is the meeting"
+        assert stk("Game over man, game over!", "over") == "Game over man, game"
+        assert stk("No keyword here", "over") == "No keyword here"
+        assert stk("over", "over") == ""
+        assert stk("Push it over the line", "over") == "Push it over the line"
+        assert stk("anything", "") == "anything"
+
+
 class TestManualInterrupt:
     """The on-screen backup interrupt: {"type": "interrupt"}."""
 

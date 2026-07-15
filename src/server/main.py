@@ -33,6 +33,7 @@ from .vad import VoiceActivityDetector
 from .turn import (
     BARGE_CANDIDATE,
     BARGE_IN,
+    EOT_KEYWORD_CANDIDATE,
     EOT_PENDING,
     TURN_COMMITTED,
     USER_SPEECH_STARTED,
@@ -52,6 +53,14 @@ _VOICE_DEBUG = os.getenv("OPENCLAW_VOICE_DEBUG", "1").strip().lower() not in ("0
 _VOICE_LOG_PATH = os.path.expanduser(
     os.getenv("OPENCLAW_VOICE_LOG", "~/Library/Logs/openclaw-voice-events.jsonl")
 )
+
+
+# Slow-response acknowledgment: if the agent hasn't produced audio within
+# this many seconds of the turn committing, play a short canned ack.
+# Tuned from 2026-07-15 field metrics so it fires on roughly the slowest
+# 15-20% of turns. 0 disables.
+_ACK_AFTER_SECS = float(os.getenv("OPENCLAW_ACK_AFTER_SECS", "12"))
+_ack_clip: dict = {"data": "", "rate": 24000}
 
 
 def voice_log(event: str, **fields) -> None:
@@ -203,6 +212,18 @@ async def startup():
     except Exception as e:
         logger.warning(f"Pipeline warm-up failed (non-fatal): {e}")
 
+    # Pre-synthesize the slow-response ack clip in the active voice.
+    if _ACK_AFTER_SECS > 0:
+        try:
+            chunks = []
+            async for c in tts.synthesize_stream("Got it — working on it."):
+                chunks.append(c)
+            _ack_clip["data"] = base64.b64encode(b"".join(chunks)).decode()
+            _ack_clip["rate"] = getattr(tts, "sample_rate", 24000)
+            logger.info(f"Slow-ack clip cached ({len(_ack_clip['data'])//1024}KB, fires at {_ACK_AFTER_SECS:.0f}s)")
+        except Exception as e:
+            logger.warning(f"Slow-ack synthesis failed (feature off): {e}")
+
     # Initialize VAD
     logger.info("Loading VAD model")
     vad = VoiceActivityDetector()
@@ -296,6 +317,8 @@ async def run_turn(
     t_commit: Optional[float] = None,
     stop_phrases=None,
     silence_secs: Optional[float] = None,
+    eot_keyword: str = "",
+    first_audio_event: Optional[asyncio.Event] = None,
 ) -> float:
     """One full response turn: STT → streamed LLM → sentence-level TTS.
 
@@ -321,6 +344,7 @@ async def run_turn(
         "text": transcript,
         "final": True,
     }))
+    transcript = strip_trailing_keyword(transcript, eot_keyword)
     logger.info(f"Transcript: {transcript}")
     voice_log("transcript", turn_id=turn_id, text=transcript[:200],
               stt_ms=round((t_transcript - t_commit) * 1000))
@@ -360,6 +384,8 @@ async def run_turn(
         async for audio_chunk in tts.synthesize_stream(speech_text):
             if t_first_audio is None:
                 t_first_audio = time.monotonic()
+                if first_audio_event is not None:
+                    first_audio_event.set()
                 if continuous:
                     await websocket.send_json(
                         _tag({"type": "state", "state": "speaking"})
@@ -630,6 +656,28 @@ def _launch_response(
     engine = session.engine
     engine.set_agent_responding(True)
     session.playback_done = asyncio.Event()
+    first_audio = asyncio.Event()
+
+    ack_task = None
+    if _ACK_AFTER_SECS > 0 and _ack_clip["data"]:
+        async def _slow_ack():
+            try:
+                await asyncio.wait_for(first_audio.wait(), timeout=_ACK_AFTER_SECS)
+            except asyncio.TimeoutError:
+                # Response is in the slow tail: acknowledge so the cabin
+                # isn't dead silent while the agent works.
+                try:
+                    await websocket.send_json({
+                        "type": "audio_chunk",
+                        "data": _ack_clip["data"],
+                        "sample_rate": _ack_clip["rate"],
+                        "turn_id": turn_id,
+                    })
+                    voice_log("slow_ack_played", turn_id=turn_id,
+                              after_secs=_ACK_AFTER_SECS)
+                except Exception:
+                    pass
+        ack_task = asyncio.create_task(_slow_ack())
 
     async def _task():
         try:
@@ -642,6 +690,8 @@ def _launch_response(
                 t_commit=t_commit,
                 stop_phrases=engine.config.stop_phrase_list,
                 silence_secs=silence_secs,
+                eot_keyword=engine.config.eot_keyword,
+                first_audio_event=first_audio,
             )
             # TTS synthesizes faster than realtime, so sending finishes long
             # before the client's speakers do. Keep the barge window open
@@ -672,9 +722,54 @@ def _launch_response(
             except Exception:
                 pass
         finally:
+            first_audio.set()  # cancels a pending slow-ack cleanly
+            if ack_task is not None and not ack_task.done():
+                ack_task.cancel()
             engine.set_agent_responding(False)
 
     session.response_task = asyncio.create_task(_task())
+
+
+def strip_trailing_keyword(text: str, keyword: str) -> str:
+    """Drop a trailing end-of-turn keyword ("... and so on, over") so the
+    LLM never sees the protocol word."""
+    if not keyword:
+        return text
+    return re.sub(
+        r"[\s,.!?]*\b" + re.escape(keyword) + r"\b[\s.!?]*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).rstrip()
+
+
+async def _handle_eot_keyword(
+    websocket: WebSocket, session: _SessionState, event
+) -> None:
+    """Check whether the just-paused utterance ends with the EOT keyword."""
+    engine = session.engine
+    if engine is None or engine.state.value not in ("user_speaking", "pending_eot"):
+        return
+    keyword = engine.config.eot_keyword
+    candidate_stt = barge_stt or stt
+    if not keyword or candidate_stt is None or event.audio is None or len(event.audio) == 0:
+        return
+    try:
+        text = await asyncio.wait_for(
+            candidate_stt.transcribe(event.audio), timeout=2.0
+        )
+    except (asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
+        voice_log("eot_keyword_error", error=str(e)[:80])
+        return
+    normalized = _normalize_speech(text or "")
+    if not normalized:
+        return
+    words = normalized.split()
+    if words and words[-1] == keyword:
+        voice_log("eot_keyword_commit", tail=text.strip()[:60])
+        logger.info(f"EOT keyword heard ('{keyword}') — committing turn now")
+        events = engine.commit_keyword(time.monotonic())
+        await _handle_turn_events(websocket, session, events)
 
 
 async def _handle_barge_candidate(
@@ -759,6 +854,14 @@ async def _handle_turn_events(
                 "type": "eot_pending",
                 "turn_id": session.current_turn_id,
             })
+        elif event.type == EOT_KEYWORD_CANDIDATE:
+            # Radio-style "over": one quick tail transcription per pause.
+            # Fire-and-forget with the same in-flight guard as barge
+            # decisions — must never block the receive loop.
+            if session.barge_decision_task is None or session.barge_decision_task.done():
+                session.barge_decision_task = asyncio.create_task(
+                    _handle_eot_keyword(websocket, session, event)
+                )
         elif event.type == BARGE_CANDIDATE:
             # Fire-and-forget with an in-flight guard: transcription must
             # never block the receive loop (a hung whisper call wedged the

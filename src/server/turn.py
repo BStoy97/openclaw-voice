@@ -57,12 +57,14 @@ EOT_PENDING = "eot_pending"
 TURN_COMMITTED = "turn_committed"
 BARGE_IN = "barge_in"
 BARGE_CANDIDATE = "barge_candidate"
+EOT_KEYWORD_CANDIDATE = "eot_keyword_candidate"
 
 # TURN_COMMITTED reasons
 REASON_SEMANTIC = "semantic"   # smart-turn gate said the utterance is complete
 REASON_CEILING = "ceiling"     # patience ceiling hit
 REASON_MANUAL = "manual"       # force_commit() (legacy stop_listening)
 REASON_TIMEOUT = "timeout"     # semantic gate unavailable: 2x min_silence fallback
+REASON_KEYWORD = "keyword"     # user said the end-of-turn keyword ("over")
 
 
 class TurnState(str, Enum):
@@ -106,6 +108,8 @@ class TurnConfig:
     barge_candidate_secs: float = 0.15    # accumulated speech (AGENT_RESPONDING) to emit BARGE_CANDIDATE
     barge_gap_frames: int = 8             # non-speech frames tolerated inside a barge run (~256 ms)
     barge_responding_threshold: float = 0.35  # VAD prob counted as speech during AGENT_RESPONDING (AEC attenuates)
+    eot_keyword: str = "over"             # radio-style end-of-turn word; "" disables
+    eot_keyword_check_secs: float = 0.4   # silence before checking for the keyword
     stop_phrases: str = (                 # comma-separated; parsed to stop_phrase_list
         "stop,hold on,wait,be quiet,quiet,shut up,that's enough,enough,"
         "okay stop,ok stop,pause,never mind,nevermind,interrupt,"
@@ -137,6 +141,8 @@ class TurnConfig:
         self.barge_responding_threshold = min(
             max(float(self.barge_responding_threshold), 0.0), 1.0
         )
+        self.eot_keyword = str(self.eot_keyword).strip().lower()
+        self.eot_keyword_check_secs = max(0.2, float(self.eot_keyword_check_secs))
         self.stop_phrases = str(self.stop_phrases)
         # Parsed once here; per-session overrides flow through from_env ->
         # _parse (str passthrough) -> this clamp, so they re-parse too.
@@ -325,6 +331,7 @@ class TurnEngine:
         self._last_speech_time = 0.0
         self._next_semantic_check = 0.0
         self._resume_speech_run = 0
+        self._keyword_checked_at = 0.0
         self._barge_speech_run = 0
         self._barge_nonspeech_run = 0
         self._barge_fallback_run = 0
@@ -396,6 +403,12 @@ class TurnEngine:
         else:
             raise ValueError(f"Unknown barge decision: {decision!r}")
 
+    def commit_keyword(self, now: float) -> List[TurnEvent]:
+        """Commit immediately: the end-of-turn keyword was heard."""
+        if self.state in (TurnState.USER_SPEAKING, TurnState.PENDING_EOT) and self._turn_frames:
+            return [self._commit(REASON_KEYWORD, now)]
+        return []
+
     def force_commit(self) -> List[TurnEvent]:
         """Commit whatever turn audio has accumulated (legacy stop_listening)."""
         if self.state in (TurnState.USER_SPEAKING, TurnState.PENDING_EOT) and self._turn_frames:
@@ -413,6 +426,7 @@ class TurnEngine:
         self._last_speech_time = 0.0
         self._next_semantic_check = 0.0
         self._resume_speech_run = 0
+        self._keyword_checked_at = 0.0
         self._reset_barge()
         self._barge_suppressed = False
         self.last_semantic_prob = None
@@ -460,8 +474,23 @@ class TurnEngine:
             self._turn_frames.append(frame)
             if is_speech:
                 self._last_speech_time = now
+                self._keyword_checked_at = 0.0  # re-arm on new speech
             else:
                 silence = now - self._last_speech_time
+                # Radio-style "over": check the utterance tail well before
+                # normal silence detection. One check per speech run.
+                if (
+                    self.config.eot_keyword
+                    and silence >= self.config.eot_keyword_check_secs
+                    and self._keyword_checked_at < self._last_speech_time
+                ):
+                    self._keyword_checked_at = now
+                    tail = self._turn_audio()
+                    max_tail = int(2.5 * SAMPLE_RATE)
+                    if len(tail) > max_tail:
+                        tail = tail[-max_tail:]
+                    if len(tail) > 0:
+                        events.append(TurnEvent(EOT_KEYWORD_CANDIDATE, audio=tail))
                 if self.semantic_active:
                     if silence >= self.config.min_silence_secs:
                         self.state = TurnState.PENDING_EOT
