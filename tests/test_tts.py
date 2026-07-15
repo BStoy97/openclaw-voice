@@ -105,8 +105,16 @@ class _FakeProcess:
         self.stdout = _FakeStdout(data)
         self.stderr = _FakeStderr()
         self._returncode = returncode
+        self.returncode = None  # None until wait(), like asyncio.subprocess
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+        if self._returncode == 0:
+            self._returncode = -9
 
     async def wait(self):
+        self.returncode = self._returncode
         return self._returncode
 
 

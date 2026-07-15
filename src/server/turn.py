@@ -102,12 +102,13 @@ class TurnConfig:
     semantic_enabled: bool = True         # use the smart-turn gate
     barge_in_min_speech_secs: float = 0.5 # sustained speech to interrupt the agent
     semantic_threshold: float = 0.5       # P(turn complete) needed to commit
-    barge_candidate_secs: float = 0.25    # accumulated speech (AGENT_RESPONDING) to emit BARGE_CANDIDATE
+    barge_candidate_secs: float = 0.15    # accumulated speech (AGENT_RESPONDING) to emit BARGE_CANDIDATE
     barge_gap_frames: int = 8             # non-speech frames tolerated inside a barge run (~256 ms)
     barge_responding_threshold: float = 0.35  # VAD prob counted as speech during AGENT_RESPONDING (AEC attenuates)
     stop_phrases: str = (                 # comma-separated; parsed to stop_phrase_list
-        "stop,hold on,wait,be quiet,quiet,shut up,that's enough,"
-        "okay stop,ok stop,pause,never mind,nevermind,interrupt"
+        "stop,hold on,wait,be quiet,quiet,shut up,that's enough,enough,"
+        "okay stop,ok stop,pause,never mind,nevermind,interrupt,"
+        "interruption,stop talking,hush"
     )
 
     def __post_init__(self):

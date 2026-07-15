@@ -327,6 +327,49 @@ class TestContinuousMode:
             assert state_after is not None
 
 
+class TestManualInterrupt:
+    """The on-screen backup interrupt: {"type": "interrupt"}."""
+
+    @pytest.mark.asyncio
+    async def test_interrupt_in_listening_state_acks(self, server):
+        import websockets
+
+        ws_url, _ = server
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({"type": "session_start", "mode": "continuous"}))
+            await ws.recv()  # session_started
+            await ws.recv()  # state listening
+            await ws.send(json.dumps({"type": "interrupt"}))
+            got = []
+            for _ in range(3):
+                try:
+                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+                except asyncio.TimeoutError:
+                    break
+                got.append(msg["type"])
+                if msg["type"] == "state":
+                    break
+            assert "tts_cancelled" in got  # always flushes client playback
+            assert "state" in got
+
+    @pytest.mark.asyncio
+    async def test_interrupt_without_session_is_safe(self, server):
+        import websockets
+
+        ws_url, _ = server
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({"type": "interrupt"}))
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+            assert msg["type"] == "tts_cancelled"
+            # connection stays usable
+            await ws.send(json.dumps({"type": "ping"}))
+            for _ in range(3):
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+                if msg["type"] == "pong":
+                    break
+            assert msg["type"] == "pong"
+
+
 class TestSessionResume:
     """Reconnect session continuity: client_id resume registry."""
 

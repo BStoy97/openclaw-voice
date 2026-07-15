@@ -234,14 +234,25 @@ class TTSEngine:
                     break
                 yield chunk
         finally:
+            # Cancellation (barge-in / manual interrupt) lands here with
+            # piper still running — kill it FIRST, otherwise awaiting its
+            # exit blocks the interrupt path behind unread synthesis.
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
             stderr = b""
             if proc.stderr is not None:
                 try:
                     stderr = await proc.stderr.read()
                 except Exception:
                     pass
-            returncode = await proc.wait()
-            if returncode != 0:
+            try:
+                returncode = await proc.wait()
+            except Exception:
+                returncode = -1
+            if returncode not in (0, -9):  # -9 = our own kill
                 logger.error(f"piper exited {returncode}: {stderr.decode(errors='ignore')}")
 
     # ------------------------------------------------------------------ #

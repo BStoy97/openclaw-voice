@@ -44,6 +44,29 @@ from .text_utils import clean_for_speech
 
 load_dotenv()
 
+# --- Field diagnostics ------------------------------------------------------
+# Structured JSONL event log for in-car test review (transcripts, barge
+# decisions, timings, lifecycle). ON by default while driving-mode testing
+# is active; disable with OPENCLAW_VOICE_DEBUG=0 once operations are stable.
+_VOICE_DEBUG = os.getenv("OPENCLAW_VOICE_DEBUG", "1").strip().lower() not in ("0", "false", "off")
+_VOICE_LOG_PATH = os.path.expanduser(
+    os.getenv("OPENCLAW_VOICE_LOG", "~/Library/Logs/openclaw-voice-events.jsonl")
+)
+
+
+def voice_log(event: str, **fields) -> None:
+    """Append one structured diagnostic event. Never raises."""
+    if not _VOICE_DEBUG:
+        return
+    try:
+        import datetime as _dt
+        rec = {"ts": _dt.datetime.now().isoformat(timespec="milliseconds"), "event": event}
+        rec.update(fields)
+        with open(_VOICE_LOG_PATH, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
 
 class Settings(BaseSettings):
     """Server configuration."""
@@ -87,6 +110,7 @@ app = FastAPI(title="OpenClaw Voice", version="0.1.0")
 
 # Global instances (initialized on startup)
 stt: Optional[WhisperSTT] = None
+barge_stt: Optional[WhisperSTT] = None
 tts: Optional[ChatterboxTTS] = None
 backend: Optional[AIBackend] = None
 vad: Optional[VoiceActivityDetector] = None
@@ -95,7 +119,7 @@ vad: Optional[VoiceActivityDetector] = None
 @app.on_event("startup")
 async def startup():
     """Initialize models on server start."""
-    global stt, tts, backend, vad
+    global stt, barge_stt, tts, backend, vad
     
     logger.info("Initializing OpenClaw Voice server...")
     
@@ -113,6 +137,18 @@ async def startup():
         device=settings.stt_device,
     )
     
+    # Barge-candidate STT: reuses the main model by default. A separate
+    # smaller model sounds attractive latency-wise, but two CTranslate2
+    # models in one process deadlock in native code (observed 2026-07-15:
+    # whole event loop wedged mid-response). Opt in explicitly via
+    # OPENCLAW_BARGE_STT_MODEL only for supervised experiments.
+    barge_model = os.getenv("OPENCLAW_BARGE_STT_MODEL", "")
+    if barge_model and barge_model != settings.stt_model:
+        logger.warning(f"Loading separate barge STT model: {barge_model} (experimental)")
+        barge_stt = WhisperSTT(model_name=barge_model, device=settings.stt_device)
+    else:
+        barge_stt = stt
+
     # Initialize TTS
     logger.info(f"Loading TTS model: {settings.tts_model}")
     tts = ChatterboxTTS(
@@ -267,6 +303,8 @@ async def run_turn(
         "final": True,
     }))
     logger.info(f"Transcript: {transcript}")
+    voice_log("transcript", turn_id=turn_id, text=transcript[:200],
+              stt_ms=round((t_transcript - t_commit) * 1000))
 
     if not transcript.strip():
         return 0.0
@@ -356,6 +394,8 @@ async def run_turn(
         "text": full_response,
     }))
     logger.info(f"Response complete: {full_response[:100]}...")
+    voice_log("response_complete", turn_id=turn_id, chars=len(full_response),
+              audio_secs=round(audio_bytes_sent / 2 / sample_rate, 2))
 
     if continuous:
         t_done = time.monotonic()
@@ -388,6 +428,7 @@ class _SessionState:
         self.current_turn_id: Optional[int] = None
         self.client_id: Optional[str] = None
         self.playback_done: Optional[asyncio.Event] = None
+        self.barge_decision_task: Optional[asyncio.Task] = None
 
 
 # --- Reconnect session continuity -------------------------------------------
@@ -473,7 +514,7 @@ def _park_session(session: "_SessionState") -> None:
 # a short low-threshold speech run; we transcribe it and decide:
 #
 #   stop phrase heard  -> 'cancel'   kill playback, discard the audio
-#   >= 3 words         -> 'takeover' kill playback, the speech becomes the
+#   >= 2 words         -> 'takeover' kill playback, the speech becomes the
 #                                    user's next turn (buffer seeds it)
 #   empty / 1-2 fillers -> 'ignore'  agent keeps talking
 #
@@ -489,14 +530,20 @@ def _normalize_speech(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_BARGE_FILLER_WORDS = frozenset(
+    "um uh uhh er hmm hm mm mhm ah oh okay ok yeah well like so right sure".split()
+)
+
+
 def decide_barge(
     text: str, stop_phrases: Optional[Sequence[str]] = None
 ) -> str:
     """Classify a barge-candidate transcript: 'cancel' | 'takeover' | 'ignore'.
 
     Stop phrases match word-boundary-aware ("stop" never matches
-    "stopwatch") anywhere in the utterance. Anything else with >= 3 words
-    is a genuine talk-over; shorter fragments are treated as noise.
+    "stopwatch") anywhere in the utterance. Anything else with >= 2 words
+    of which at least one is a content (non-filler) word is a genuine
+    talk-over; filler-only fragments and single words are noise.
     """
     normalized = _normalize_speech(text or "")
     if not normalized:
@@ -506,21 +553,29 @@ def decide_barge(
         p = _normalize_speech(phrase)
         if p and re.search(r"\b" + re.escape(p) + r"\b", normalized):
             return "cancel"
-    if len(normalized.split()) >= 3:
+    words = normalized.split()
+    content = [w for w in words if w not in _BARGE_FILLER_WORDS]
+    if len(words) >= 2 and len(content) >= 1:
         return "takeover"
     return "ignore"
 
 
 async def _cancel_response_task(session: _SessionState) -> bool:
     """Cancel the in-flight response pipeline, if any. Returns True if one
-    was actually cancelled."""
+    was actually cancelled.
+
+    Bounded wait: TTS-subprocess generator cleanup can stall on
+    cancellation (observed with the manual interrupt mid-generation) —
+    never let that block the interrupt path. The task's finally-cleanup
+    still runs whenever it does finish dying.
+    """
     task = session.response_task
     if task is None or task.done():
         return False
     task.cancel()
     try:
-        await task
-    except asyncio.CancelledError:
+        await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
     except Exception as e:  # noqa: BLE001 - task errors already logged there
         logger.debug(f"Cancelled response task raised: {e}")
@@ -593,13 +648,26 @@ async def _handle_barge_candidate(
     engine = session.engine
     if engine is None:
         return
-    if stt is None or event.audio is None or len(event.audio) == 0:
+    candidate_stt = barge_stt or stt
+    if candidate_stt is None or event.audio is None or len(event.audio) == 0:
         return  # unresolved -> pure-VAD fallback handles it
+    t_cand = time.monotonic()
     try:
-        text = await stt.transcribe(event.audio)
+        text = await asyncio.wait_for(
+            candidate_stt.transcribe(event.audio), timeout=2.5
+        )
+    except asyncio.TimeoutError:
+        voice_log("barge_transcribe_timeout", buffer_secs=round(len(event.audio) / 16000, 2))
+        logger.warning("Barge-candidate transcription timed out (2.5s); relying on pure-VAD fallback")
+        return
     except Exception as e:  # noqa: BLE001 - degrade to the fallback path
+        voice_log("barge_transcribe_error", error=str(e)[:120])
         logger.debug(f"Barge-candidate transcription failed: {e}")
         return
+    voice_log("barge_decision",
+              text=text.strip()[:80],
+              decision=decide_barge(text, engine.config.stop_phrase_list),
+              transcribe_ms=round((time.monotonic() - t_cand) * 1000))
     decision = decide_barge(text, engine.config.stop_phrase_list)
     now = time.monotonic()
 
@@ -613,6 +681,7 @@ async def _handle_barge_candidate(
         engine.resolve_barge("cancel", now)
         engine.set_agent_responding(False)
         logger.info(f"Stop-phrase barge: '{text.strip()}'")
+        voice_log("stop_phrase_cancel", text=text.strip()[:80])
     elif decision == "takeover":
         # Genuine talk-over: the buffered speech becomes the new user turn.
         await _cancel_response_task(session)
@@ -626,6 +695,7 @@ async def _handle_barge_candidate(
             "turn_id": session.current_turn_id,
         })
         logger.info(f"Takeover barge: '{text.strip()}'")
+        voice_log("takeover_barge", text=text.strip()[:80])
     else:
         engine.resolve_barge("ignore", now)
         logger.debug(f"Ignored barge candidate: '{text.strip()}'")
@@ -649,10 +719,21 @@ async def _handle_turn_events(
                 "turn_id": session.current_turn_id,
             })
         elif event.type == BARGE_CANDIDATE:
-            await _handle_barge_candidate(websocket, session, event)
+            # Fire-and-forget with an in-flight guard: transcription must
+            # never block the receive loop (a hung whisper call wedged the
+            # whole pipeline in field testing 2026-07-15), and must never
+            # pile up. If it times out, the engine's 1.2 s pure-VAD
+            # fallback still interrupts on sustained speech.
+            if session.barge_decision_task is None or session.barge_decision_task.done():
+                session.barge_decision_task = asyncio.create_task(
+                    _handle_barge_candidate(websocket, session, event)
+                )
+            else:
+                voice_log("barge_candidate_skipped", reason="decision in flight")
         elif event.type == BARGE_IN:
             # Legacy pure-VAD fallback (candidates went unresolved).
             logger.info("Barge-in: cancelling agent response")
+            voice_log("vad_fallback_barge_in")
             if await _cancel_response_task(session):
                 await websocket.send_json({"type": "tts_cancelled"})
         elif event.type == TURN_COMMITTED:
@@ -818,7 +899,32 @@ async def websocket_endpoint(websocket: WebSocket):
                             "speech_detected": has_speech,
                         })
 
+            elif msg["type"] == "interrupt":
+                # On-screen backup interrupt: kill the current reply but keep
+                # the session alive and listening. In LISTENING state it
+                # force-commits whatever the engine has (tap = "answer now").
+                cancelled = await _cancel_response_task(session)
+                await websocket.send_json({"type": "tts_cancelled"})
+                if session.engine:
+                    if cancelled or session.engine.agent_responding:
+                        session.engine.resolve_barge("cancel", time.monotonic())
+                        session.engine.set_agent_responding(False)
+                        await websocket.send_json({"type": "state", "state": "listening"})
+                        logger.info("Manual interrupt (button)")
+                        voice_log("manual_interrupt", context="agent_responding")
+                    else:
+                        events = session.engine.force_commit()
+                        if events:
+                            logger.info("Manual commit (button)")
+                            voice_log("manual_interrupt", context="commit")
+                            await _handle_turn_events(websocket, session, events)
+                        else:
+                            await websocket.send_json({"type": "state", "state": "listening"})
+                else:
+                    await websocket.send_json({"type": "state", "state": "listening"})
+
             elif msg["type"] == "playback_done":
+                voice_log("playback_done", turn_id=msg.get("turn_id"))
                 if session.playback_done is not None:
                     session.playback_done.set()
 

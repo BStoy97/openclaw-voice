@@ -186,7 +186,8 @@ class TestBargeIn:
         engine.set_agent_responding(True)
         assert engine.state == TurnState.AGENT_RESPONDING
 
-        events, t = drive(engine, [0.9] * 6, 0.0)  # ~0.19 s
+        n_cand = max(1, int(round(engine.config.barge_candidate_secs / FRAME_SECS)))
+        events, t = drive(engine, [0.9] * (n_cand - 1), 0.0)  # just under candidate length
         assert not [e for e in events if e.type in (BARGE_IN, BARGE_CANDIDATE)]
         events, _ = drive(engine, [0.0] * 20, t)
         assert not [e for e in events if e.type in (BARGE_IN, BARGE_CANDIDATE)]
@@ -245,7 +246,7 @@ class TestBargeCandidate:
         """0.35 s of accumulated speech at prob 0.4 — below start_threshold
         (0.5) but above barge_responding_threshold (0.35) — with a gap up
         to barge_gap_frames still emits a candidate (in-car AEC ducking)."""
-        engine = make_engine(FakeGate(0.9))
+        engine = make_engine(FakeGate(0.9), barge_candidate_secs=0.35)
         assert engine.config.start_threshold == 0.5  # 0.4 would NOT start a turn
         engine.set_agent_responding(True)
 
@@ -259,7 +260,7 @@ class TestBargeCandidate:
         assert engine.state == TurnState.AGENT_RESPONDING
 
     def test_gap_beyond_tolerance_resets_run(self):
-        engine = make_engine(FakeGate(0.9))
+        engine = make_engine(FakeGate(0.9), barge_candidate_secs=0.35)
         engine.set_agent_responding(True)
 
         probs = [0.4] * 5 + [0.0] * 9 + [0.4] * 6  # gap 9 >= 8: run dies
@@ -273,7 +274,8 @@ class TestBargeCandidate:
         engine = make_engine(FakeGate(0.9))
         engine.set_agent_responding(True)
 
-        events, _ = drive(engine, [0.4] * 23, 0.0)  # 2 x ~0.35 s runs
+        n_cand = max(1, int(round(engine.config.barge_candidate_secs / FRAME_SECS)))
+        events, _ = drive(engine, [0.4] * (2 * n_cand + 1), 0.0)  # two candidate runs
         candidates = [e for e in events if e.type == BARGE_CANDIDATE]
         assert len(candidates) == 2
         assert len(candidates[1].audio) > len(candidates[0].audio)
@@ -371,10 +373,11 @@ class TestConfig:
 
     def test_barge_defaults(self):
         config = TurnConfig()
-        assert config.barge_candidate_secs == 0.25
+        assert config.barge_candidate_secs == 0.15
         assert config.barge_gap_frames == 8
         assert config.barge_responding_threshold == 0.35
-        for phrase in ("stop", "hold on", "wait", "that's enough", "nevermind"):
+        for phrase in ("stop", "hold on", "wait", "that's enough", "nevermind",
+                       "interruption", "stop talking"):
             assert phrase in config.stop_phrase_list
 
     def test_barge_fields_clamped(self):

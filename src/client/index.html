@@ -425,7 +425,7 @@
         <canvas id="ringCanvas"></canvas>
         <div id="orb"></div>
         <div id="stateWord">IDLE</div>
-        <div id="ptt-hint">hold ring to force-listen</div>
+        <div id="ptt-hint">tap ring = interrupt · hold = force-listen</div>
       </div>
     </div>
     <div id="captions">
@@ -777,7 +777,8 @@
   };
 
   async function startMic(){
-    if (mic.ready) return;
+    if (mic.ready && micTrackLive()) return;
+    if (mic.ready) { tearDownMic(); }  // stale ready flag over a dead track
     if (mic.starting) return mic.starting;
     mic.starting = (async () => {
       mic.stream = await navigator.mediaDevices.getUserMedia({
@@ -813,6 +814,7 @@
 
       node.port.onmessage = (evt) => {
         const msg = evt.data;
+        mic.lastFrameAt = performance.now();
         if (msg.t === 'rms') {
           S.micRMS = msg.v;
         } else if (msg.t === 'audio') {
@@ -822,12 +824,61 @@
         }
       };
 
+      // iOS kills the capture track when another app steals the audio
+      // route (nav prompt, call, BT handoff). Rebuild immediately on death.
+      const track = mic.stream.getAudioTracks()[0];
+      if (track) {
+        track.onended = () => { flashDevAid('mic track ended — rebuilding'); rebuildMic(); };
+      }
+
       mic.ctx = ctx;
       mic.node = node;
+      mic.lastFrameAt = performance.now();
       mic.ready = true;
     })();
     try { await mic.starting; } finally { mic.starting = null; }
   }
+
+  function micTrackLive(){
+    const t = mic.stream && mic.stream.getAudioTracks()[0];
+    return !!(t && t.readyState === 'live' && mic.ready);
+  }
+
+  function tearDownMic(){
+    try { if (mic.node) mic.node.disconnect(); } catch(e){}
+    try { if (mic.ctx) mic.ctx.close(); } catch(e){}
+    try { if (mic.stream) mic.stream.getTracks().forEach(t => t.stop()); } catch(e){}
+    mic.stream = null; mic.ctx = null; mic.node = null; mic.ready = false;
+  }
+
+  let micRebuilding = false;
+  async function rebuildMic(){
+    if (micRebuilding) return;
+    micRebuilding = true;
+    try {
+      tearDownMic();
+      await startMic();
+      flashDevAid('mic rebuilt');
+    } catch (e) {
+      flashDevAid('mic rebuild failed: ' + (e && e.message || e));
+    } finally {
+      micRebuilding = false;
+    }
+  }
+
+  // Watchdog: the worklet posts frames continuously while capturing — a dead
+  // route produces NONE. If frames stop >2.5s while we should be capturing,
+  // the track silently died (the STOP/START trap from the truck): rebuild
+  // the whole capture path.
+  setInterval(() => {
+    if (!S.sessionWanted || S.held || !mic.ready || micRebuilding) return;
+    if (document.visibilityState !== 'visible') return;
+    const idleMs = performance.now() - (mic.lastFrameAt || 0);
+    if (idleMs > 2500 || !micTrackLive()) {
+      flashDevAid('mic stalled ' + Math.round(idleMs) + 'ms — rebuilding');
+      rebuildMic();
+    }
+  }, 1500);
 
   function shouldSendAudio(){
     if (!mic.ready) return false;
@@ -1045,6 +1096,9 @@
     if (mic.ctx && mic.ctx.state === 'suspended') {
       try { await mic.ctx.resume(); } catch(e){}
     }
+    // Route theft while backgrounded usually kills the capture track —
+    // resuming a context over a dead track looks alive but hears nothing.
+    if (mic.ready && !micTrackLive()) { rebuildMic(); }
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       forceReconnect();
     }
@@ -1237,6 +1291,13 @@
   const latencyPanel = document.getElementById('latencyPanel');
   function toggleLatencyPanel(){ latencyPanel.classList.toggle('open'); }
   document.getElementById('gearBtn').addEventListener('click', toggleLatencyPanel);
+  document.getElementById('stripStateText').addEventListener('click', () => {
+    if (!S.sessionWanted) return;
+    stopPlaybackInstantly();
+    sendWS({ type: 'interrupt' });
+    flashDevAid('manual interrupt');
+    render();
+  });
   document.addEventListener('keydown', (e) => {
     if ((e.key === 'l' || e.key === 'L') && !e.metaKey && !e.ctrlKey && !e.altKey) {
       const tag = (document.activeElement && document.activeElement.tagName) || '';
@@ -1293,7 +1354,16 @@
       }
       if (!S.sessionWanted) {
         beginSession();
+        return;
       }
+      // Quick tap during an active session = manual interrupt (the backup
+      // switch): instantly silence local playback and tell the server to
+      // kill the reply / commit the pending turn. Works even when voice
+      // barge-in can't hear you.
+      stopPlaybackInstantly();
+      sendWS({ type: 'interrupt' });
+      flashDevAid('manual interrupt');
+      render();
     }
     target.addEventListener('pointerdown', onDown);
     target.addEventListener('pointerup', onUp);
