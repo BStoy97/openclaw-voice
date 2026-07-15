@@ -185,14 +185,23 @@ async def startup():
             api_key=settings.openai_api_key or os.getenv("OPENAI_API_KEY"),
         )
     
-    # Warm up STT: the first CTranslate2 call JIT-initializes kernels and
-    # was costing the first real turn ~2-4s extra ("slow to get going").
+    # Warm up the pipeline: the first CTranslate2 call JIT-initializes
+    # kernels ("slow to get going" on the first real turn). Silence won't
+    # do it — whisper's VAD filter skips the encoder — so synthesize a real
+    # phrase with the TTS and transcribe that (warms piper's OS cache too).
     try:
         t0 = time.monotonic()
-        await stt.transcribe(np.zeros(8000, dtype=np.float32))
-        logger.info(f"STT warm-up done in {time.monotonic() - t0:.1f}s")
+        warm = await tts.synthesize("Voice system warming up.")
+        if warm is not None and len(warm) > 0:
+            src_rate = getattr(tts, "sample_rate", 24000)
+            idx = (np.arange(int(len(warm) * 16000 / src_rate)) * (src_rate / 16000)).astype(int)
+            warm16 = warm[idx.clip(0, len(warm) - 1)].astype(np.float32)
+            text = await stt.transcribe(warm16)
+            logger.info(f"Pipeline warm-up done in {time.monotonic() - t0:.1f}s (heard: '{text.strip()[:40]}')")
+        else:
+            logger.info("Pipeline warm-up skipped (no TTS audio)")
     except Exception as e:
-        logger.warning(f"STT warm-up failed (non-fatal): {e}")
+        logger.warning(f"Pipeline warm-up failed (non-fatal): {e}")
 
     # Initialize VAD
     logger.info("Loading VAD model")
