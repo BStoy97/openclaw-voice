@@ -181,7 +181,12 @@ async def startup():
                 "This conversation is happening via real-time voice chat. "
                 "Keep responses concise and conversational — a few sentences "
                 "at most unless the topic genuinely needs depth. "
-                "No markdown, bullet points, code blocks, or special formatting."
+                "No markdown, bullet points, code blocks, or special formatting. "
+                "IMPORTANT: if you are going to use tools, read files, or look "
+                "anything up, FIRST output one short spoken sentence saying what "
+                "you're about to do (e.g. 'Let me check the task list.') before "
+                "any tool call — the listener hears silence while you work, and "
+                "that first sentence is what fills it."
             ),
         )
     else:
@@ -411,8 +416,21 @@ async def run_turn(
             "text": chunk,
         }))
 
-        # Check for sentence boundaries
+        # Check for sentence boundaries. Until the FIRST audio goes out,
+        # also break on clause boundaries (comma/semicolon/colon after a
+        # meaningful clause) — field data showed first-token-to-first-
+        # SENTENCE adding many seconds of silence on slow streams; a
+        # slightly awkward first break beats dead air.
         seps = ['. ', '! ', '? ', '.\n', '!\n', '?\n']
+        if t_first_audio is None:
+            head = sentence_buffer
+            for csep in [', ', '; ', ': ']:
+                ci = head.find(csep)
+                if ci >= 24:  # clause is substantial enough to speak alone
+                    clause = head[: ci + 1].strip()
+                    sentence_buffer = head[ci + 2:]
+                    await speak(clause)
+                    break
         while any(sep in sentence_buffer for sep in seps):
             # Find first sentence boundary
             earliest_idx = len(sentence_buffer)
@@ -758,8 +776,8 @@ async def _handle_eot_keyword(
         text = await asyncio.wait_for(
             candidate_stt.transcribe(event.audio), timeout=2.0
         )
-    except (asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
-        voice_log("eot_keyword_error", error=str(e)[:80])
+    except Exception as e:  # noqa: BLE001 - includes TimeoutError
+        voice_log("eot_keyword_error", error=(type(e).__name__ + ": " + str(e))[:80])
         return
     normalized = _normalize_speech(text or "")
     if not normalized:
