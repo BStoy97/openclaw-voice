@@ -1,14 +1,22 @@
 {
-  "name": "OpenClaw Voice",
-  "short_name": "Voice",
-  "description": "Voice chat with your OpenClaw agent — hands-free, local STT",
+  "name": "OC Voice",
+  "short_name": "OC Voice",
+  "description": "Self-hosted voice interface for your AI agent \u2014 hands-free, local STT",
   "start_url": "/?mode=drive",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0d0d12",
-  "theme_color": "#0d0d12",
+  "background_color": "#0E0C0B",
+  "theme_color": "#0E0C0B",
   "icons": [
-    { "src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
-    { "src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+    {
+      "src": "/static/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
   ]
 }

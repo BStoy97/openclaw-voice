@@ -117,7 +117,7 @@ class TestServerHTTP:
         response = httpx.get(f"{http_url}/")
         
         assert response.status_code == 200
-        assert "OpenClaw Voice" in response.text
+        assert "OC Voice" in response.text
         assert "voice-button" in response.text
 
 
